@@ -1,0 +1,24 @@
+{
+  "name": "mis-archivadores",
+  "version": "1.0.0",
+  "description": "PWA personal para localizar objetos guardados en casa mediante una estructura sencilla y configurable. El objetivo es poder saber rápidamente **qué hay guardado y dónde está**, con preparación para sincronización entre dispositivos, fotografías y acceso mediante NFC.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sowlmak04/Mis-archivadores.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Sowlmak04/Mis-archivadores/issues"
+  },
+  "homepage": "https://github.com/Sowlmak04/Mis-archivadores#readme",
+  "devDependencies": {
+    "wrangler": "^4.147.0"
+  }
+}
