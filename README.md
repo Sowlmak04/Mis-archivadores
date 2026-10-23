@@ -49,6 +49,38 @@ v0.11.4 cierra la fase puramente local. La siguiente etapa prevista es migrar la
 
 La función «Copiar enlace» permanece retirada hasta disponer de una URL pública permanente. Las etiquetas NFC no deben grabarse todavía.
 
+## Dirección arquitectónica: inventarios e instancias
+
+El código de Mis Archivadores se mantendrá preferentemente en un único
+repositorio. El sistema deberá quedar preparado para soportar varios
+inventarios independientes, con la siguiente jerarquía funcional prevista:
+
+Inventario → Ubicación → Zona opcional → Contenedor → Índice
+
+El índice contiene los elementos descritos en el modelo actual. Las zonas
+seguirán siendo opcionales: un contenedor podrá pertenecer directamente
+a una ubicación.
+
+Una instancia podrá utilizar inicialmente un único inventario, pero el
+backend no deberá asumir que siempre existirá exactamente uno. Inventario
+e instancia son conceptos distintos: una instancia podrá alojar uno o
+varios inventarios independientes.
+
+En el futuro, el mismo repositorio podrá desplegarse en varias instancias
+independientes de Cloudflare, cada una con su propio subdominio y, cuando
+convenga, su propia base de datos D1 y su propio almacenamiento R2.
+
+La previsión actual contempla una instancia principal, otra para un
+trastero familiar y una instancia familiar independiente, todas
+administradas desde la misma cuenta de Cloudflare. La decisión definitiva
+sobre qué inventarios compartirán instancia y cuáles tendrán D1 y R2
+separadas se tomará cuando la aplicación base esté estable.
+
+Esta sección documenta la dirección arquitectónica prevista; no implica
+que el soporte para varios inventarios esté implementado. Por ahora no
+se implementarán usuarios, permisos, múltiples despliegues ni selectores
+de inventario.
+
 ## Identidad y copias de seguridad
 
 La exportación actual utiliza el formato JSON v3 y conserva los UID permanentes de contenedores y los IDs de los elementos. Restaurar una copia no debe cambiar la identidad de esos registros.
