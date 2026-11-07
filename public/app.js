@@ -1,6 +1,6 @@
 const STORAGE_KEY = "misArchivadores.data.v8";
 
-const EMPTY_DATA = { locations: [], zones: [], containers: [] };
+const EMPTY_DATA = { nextContainerNumber: 1, locations: [], zones: [], containers: [] };
 
 const SETTINGS_KEY = "misArchivadores.settings.v1";
 const DEFAULT_SETTINGS = { theme: "auto", accent: "blue" };
@@ -93,6 +93,10 @@ function normalizeData(candidate) {
     uid: c.uid || newId("container"),
     items: Array.isArray(c.items) ? c.items.map(normalizeItem).filter(item => item.name) : []
   }));
+  if (!Object.hasOwn(normalized, "nextContainerNumber")) {
+    normalized.nextContainerNumber = maxContainerNumber(normalized) + 1;
+  }
+  validateContainerCounter(normalized);
   return normalized;
 }
 
@@ -140,8 +144,9 @@ function loadData() {
     const normalized = normalizeData(loaded);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
     return normalized;
-  } catch {
-    return clone(EMPTY_DATA);
+  } catch (error) {
+    window.alert("No se han cargado los datos: " + error.message + " No se ha borrado el almacenamiento. Revisa una copia válida antes de continuar.");
+    throw error;
   }
 }
 
@@ -154,7 +159,7 @@ function saveData() {
 function exportBackup() {
   const backup = {
     app: "Mis Archivadores",
-    formatVersion: 3,
+    formatVersion: 4,
     exportedAt: new Date().toISOString(),
     data
   };
@@ -241,6 +246,8 @@ async function importBackup(file) {
 
   if (!confirmed) return false;
 
+  validateContainerCounter(data);
+  imported.nextContainerNumber = Math.max(imported.nextContainerNumber, data.nextContainerNumber);
   data = imported;
   saveData();
   return true;
@@ -277,14 +284,32 @@ function containerById(id) {
   return data.containers.find(x => x.id === id);
 }
 
-function nextContainerId() {
-  const numbers = data.containers
-    .map(c => /^C(\d+)$/.exec(c.id))
-    .filter(Boolean)
-    .map(match => Number(match[1]));
+function maxContainerNumber(candidate) {
+  return candidate.containers.reduce((maximum, c) => {
+    const match = /^C(\d+)$/.exec(c.id);
+    if (!match) return maximum;
+    const number = Number(match[1]);
+    if (!Number.isSafeInteger(number) || number < 1) {
+      throw new Error("Hay un número de contenedor inválido.");
+    }
+    return Math.max(maximum, number);
+  }, 0);
+}
 
-  const next = numbers.length ? Math.max(...numbers) + 1 : 1;
-  return `C${String(next).padStart(3, "0")}`;
+function validateContainerCounter(candidate) {
+  if (!Number.isSafeInteger(candidate.nextContainerNumber) ||
+      candidate.nextContainerNumber < 1 ||
+      candidate.nextContainerNumber <= maxContainerNumber(candidate)) {
+    throw new Error("El siguiente número de contenedor no es válido o ya se ha utilizado.");
+  }
+}
+
+function nextContainerId() {
+  validateContainerCounter(data);
+  if (!Number.isSafeInteger(data.nextContainerNumber + 1)) {
+    throw new Error("Se ha alcanzado el límite de numeración de contenedores.");
+  }
+  return `C${String(data.nextContainerNumber).padStart(3, "0")}`;
 }
 
 function newId(prefix) {
@@ -399,15 +424,13 @@ function locationView(locationId) {
       </section>
     ` : ""}
 
-    ${(!zones.length || directContainers.length) ? `
       <div class="section-title ${zones.length ? "section-spaced" : ""}">
-        <h2>${zones.length ? "Contenedores sin zona" : "Contenido"}</h2>
+        <h2>Sin zona</h2>
         <span>${directContainers.length} contenedores</span>
       </div>
       <section class="list">
         ${directContainers.length ? directContainers.map(containerRow).join("") : `<div class="empty"><strong>Sin contenedores</strong>Añade aquí el primer archivador, caja, cajón u otro elemento que quieras indexar.</div>`}
       </section>
-    ` : ""}
 
     <div class="actions">
       <button class="primary-button" data-add-location-container>+ Añadir contenedor sin zona</button>
@@ -524,7 +547,9 @@ function newContainerView(zoneId) {
       return;
     }
 
-    const id = nextContainerId();
+    let id;
+    try { id = nextContainerId(); }
+    catch (error) { window.alert(error.message); return; }
     const container = {
       id,
       uid: newId("container"),
@@ -537,6 +562,7 @@ function newContainerView(zoneId) {
     };
 
     data.containers.push(container);
+    data.nextContainerNumber += 1;
     saveData();
     showToast("Contenedor creado");
     setTimeout(() => navigate(`#container/${id}`), 250);
@@ -608,7 +634,9 @@ function newLocationContainerView(locationId) {
       return;
     }
 
-    const id = nextContainerId();
+    let id;
+    try { id = nextContainerId(); }
+    catch (error) { window.alert(error.message); return; }
     data.containers.push({
       id,
       uid: newId("container"),
@@ -620,6 +648,7 @@ function newLocationContainerView(locationId) {
       items: itemNamesFromTextarea(document.querySelector("#newItems").value).map(name => normalizeItem(name))
     });
 
+    data.nextContainerNumber += 1;
     saveData();
     showToast("Contenedor creado");
     setTimeout(() => navigate(`#container/${id}`), 250);
@@ -668,8 +697,9 @@ function containerView(id) {
       `).join("") : `<div class="empty"><strong>Índice vacío</strong>Edita este contenedor para añadir contenido.</div>`}
     </section>
 
-    <div class="actions single-action">
+    <div class="actions">
       <button class="primary-button" data-edit>Editar contenedor</button>
+      <button class="secondary-button" data-move>Mover contenedor</button>
     </div>
   `;
 
@@ -677,7 +707,50 @@ function containerView(id) {
   app.querySelector("[data-location-link]")?.addEventListener("click", () => navigate(`#location/${c.locationId}`));
   app.querySelector("[data-zone-link]")?.addEventListener("click", () => navigate(`#zone/${c.zoneId}`));
   app.querySelector("[data-edit]")?.addEventListener("click", () => navigate(`#edit/${c.id}`));
+  app.querySelector("[data-move]")?.addEventListener("click", () => navigate(`#move/${c.id}`));
   app.querySelectorAll("[data-item]").forEach(btn => btn.addEventListener("click", () => navigate(`#item/${c.uid}/${btn.dataset.item}`)));
+}
+
+function moveContainerView(id) {
+  const c = containerById(id);
+  if (!c) return notFound();
+  screenTitle.textContent = "Mover contenedor";
+  setActiveTab("home");
+  const locationOptions = sortedLocations().map(loc => `<option value="${loc.id}" ${loc.id === c.locationId ? "selected" : ""}>${escapeHTML(loc.name)}</option>`).join("");
+  app.innerHTML = `
+    <div class="breadcrumbs"><button data-back>‹ Volver a ${escapeHTML(c.id)}</button></div>
+    <form class="editor" id="moveContainerForm">
+      <div class="field"><label for="locationSelect">Ubicación</label><select id="locationSelect">${locationOptions}</select></div>
+      <div class="field"><label for="zoneSelect">Zona</label><select id="zoneSelect"></select><p class="helper">Sin zona guarda el contenedor directamente en la ubicación.</p></div>
+      <div class="actions">
+        <button type="button" class="secondary-button" data-cancel>Cancelar</button>
+        <button type="submit" class="primary-button">Mover contenedor</button>
+      </div>
+    </form>`;
+  const back = () => navigate(`#container/${c.id}`);
+  const locationSelect = app.querySelector("#locationSelect");
+  const zoneSelect = app.querySelector("#zoneSelect");
+  function renderZoneOptions(preferredZoneId = null) {
+    zoneSelect.innerHTML = `<option value="">Sin zona</option>` + zonesForLocation(locationSelect.value).map(zone => `<option value="${zone.id}" ${zone.id === preferredZoneId ? "selected" : ""}>${escapeHTML(zone.name)}</option>`).join("");
+  }
+  renderZoneOptions(c.zoneId);
+  locationSelect.addEventListener("change", () => renderZoneOptions());
+  app.querySelector("[data-back]").addEventListener("click", back);
+  app.querySelector("[data-cancel]").addEventListener("click", back);
+  app.querySelector("#moveContainerForm").addEventListener("submit", event => {
+    event.preventDefault();
+    const locationId = locationSelect.value;
+    const zoneId = zoneSelect.value || null;
+    if (!locationById(locationId) || (zoneId && zoneById(zoneId)?.locationId !== locationId)) {
+      window.alert("Selecciona una ubicación y una zona válidas. No se ha movido el contenedor.");
+      return;
+    }
+    c.locationId = locationId;
+    c.zoneId = zoneId;
+    saveData();
+    showToast("Contenedor movido");
+    back();
+  });
 }
 
 function editView(id) {
@@ -686,18 +759,12 @@ function editView(id) {
 
   screenTitle.textContent = "Editar contenedor";
   setActiveTab("home");
-
-  const locationOptions = data.locations.map(loc => `<option value="${loc.id}" ${loc.id === c.locationId ? "selected" : ""}>${escapeHTML(loc.name)}</option>`).join("");
-
   app.innerHTML = `
     <div class="breadcrumbs"><button data-back>‹ Volver a ${escapeHTML(c.id)}</button></div>
     <form class="editor" id="editorForm">
       <div class="field"><label for="name">Nombre</label><input id="name" value="${escapeHTML(c.name)}" autocomplete="off" /></div>
       <div class="field"><label for="type">Tipo</label><input id="type" value="${escapeHTML(c.type)}" autocomplete="off" /></div>
       <div class="field"><label for="note">Nota</label><input id="note" value="${escapeHTML(c.note || "")}" autocomplete="off" /></div>
-
-      <div class="field"><label for="locationSelect">Ubicación</label><select id="locationSelect">${locationOptions}</select></div>
-      <div class="field"><label for="zoneSelect">Zona</label><select id="zoneSelect"></select><p class="helper">Puedes dejar el contenedor directamente en la ubicación o asignarlo a una de sus zonas.</p></div>
 
       <div class="field"><label for="items">Índice</label><textarea id="items" spellcheck="true">${escapeHTML(c.items.map(item => item.name).join("\n"))}</textarea><p class="helper">Una entrada por línea. Puedes añadir, borrar o reordenar libremente.</p></div>
 
@@ -715,16 +782,6 @@ function editView(id) {
   `;
 
   const back = () => navigate(`#container/${c.id}`);
-  const locationSelect = app.querySelector("#locationSelect");
-  const zoneSelect = app.querySelector("#zoneSelect");
-
-  function renderZoneOptions(preferredZoneId = null) {
-    const zones = data.zones.filter(zone => zone.locationId === locationSelect.value);
-    zoneSelect.innerHTML = `<option value="">Sin zona</option>` + zones.map(zone => `<option value="${zone.id}" ${zone.id === preferredZoneId ? "selected" : ""}>${escapeHTML(zone.name)}</option>`).join("");
-  }
-
-  renderZoneOptions(c.zoneId || null);
-  locationSelect.addEventListener("change", () => renderZoneOptions(null));
   app.querySelector("[data-back]")?.addEventListener("click", back);
   app.querySelector("[data-cancel]")?.addEventListener("click", back);
 
@@ -733,8 +790,6 @@ function editView(id) {
     c.name = app.querySelector("#name").value.trim() || c.name;
     c.type = app.querySelector("#type").value.trim() || c.type;
     c.note = app.querySelector("#note").value.trim();
-    c.locationId = locationSelect.value;
-    c.zoneId = zoneSelect.value || null;
     c.items = reconcileItems(c.items, itemNamesFromTextarea(app.querySelector("#items").value));
     saveData();
     showToast("Contenedor actualizado");
@@ -857,7 +912,7 @@ function searchView() {
 
 
 function zonesEditView(expandedLocations = new Set()) {
-  screenTitle.textContent = "Editar zonas";
+  screenTitle.textContent = "Gestionar ubicaciones y zonas";
   setActiveTab("");
   app.innerHTML = `
     <section class="detail-header settings-header"><h2>Ubicaciones y zonas</h2><p>Crea la estructura que necesites. Toca una ubicación para desplegar o plegar sus zonas.</p></section>
@@ -921,14 +976,34 @@ function zonesEditView(expandedLocations = new Set()) {
     zone.name=name; saveData(); zonesEditView(expandedLocations); showToast("Zona actualizada");
   }));
   app.querySelectorAll("[data-delete-zone]").forEach(btn => btn.addEventListener("click", () => {
-    const zone=zoneById(btn.dataset.deleteZone); const count=data.containers.filter(c=>c.zoneId===zone.id).length;
-    const msg=count ? `“${zone.name}” contiene ${count} contenedores. Si continúas se eliminarán también.\n\n¿Eliminar zona?` : `¿Eliminar la zona “${zone.name}”?`;
-    if(!window.confirm(msg))return; data.containers=data.containers.filter(c=>c.zoneId!==zone.id); data.zones=data.zones.filter(z=>z.id!==zone.id); saveData(); zonesEditView(expandedLocations); showToast("Zona eliminada");
+    const zone = zoneById(btn.dataset.deleteZone);
+    const containers = data.containers.filter(c => c.zoneId === zone?.id);
+    if (!zone || !locationById(zone.locationId) || containers.some(c => c.locationId !== zone.locationId)) {
+      window.alert("La zona tiene relaciones incoherentes. No se ha eliminado ni movido ningún dato.");
+      return;
+    }
+    const msg = containers.length
+      ? `“${zone.name}” contiene ${containers.length} contenedores. Se moverán a “Sin zona” dentro de “${locationById(zone.locationId).name}”, conservando sus índices.\n\nMover a Sin zona y eliminar zona: ¿continuar?`
+      : `¿Eliminar la zona “${zone.name}”?`;
+    if (!window.confirm(msg)) return;
+    containers.forEach(c => { c.zoneId = null; });
+    data.zones = data.zones.filter(z => z.id !== zone.id);
+    saveData(); zonesEditView(expandedLocations); showToast("Zona eliminada");
   }));
   app.querySelectorAll("[data-delete-location]").forEach(btn => btn.addEventListener("click", e => {
-    e.stopPropagation(); const loc=locationById(btn.dataset.deleteLocation); const count=data.containers.filter(c=>c.locationId===loc.id).length; const zcount=data.zones.filter(z=>z.locationId===loc.id).length;
-    if(!window.confirm(`Eliminar “${loc.name}” eliminará también ${zcount} zonas y ${count} contenedores.\n\n¿Continuar?`))return;
-    data.containers=data.containers.filter(c=>c.locationId!==loc.id); data.zones=data.zones.filter(z=>z.locationId!==loc.id); data.locations=data.locations.filter(l=>l.id!==loc.id); expandedLocations.delete(loc.id); saveData(); zonesEditView(expandedLocations); showToast("Ubicación eliminada");
+    e.stopPropagation();
+    const loc = locationById(btn.dataset.deleteLocation);
+    if (!loc) return;
+    const count = data.containers.filter(c => c.locationId === loc.id).length;
+    const zcount = data.zones.filter(z => z.locationId === loc.id).length;
+    if (count || zcount) {
+      window.alert(`“${loc.name}” contiene ${zcount} zonas y ${count} contenedores. Primero mueve o elimina explícitamente sus zonas y contenedores. No se ha eliminado nada.`);
+      return;
+    }
+    if (!window.confirm(`¿Eliminar la ubicación vacía “${loc.name}”?`)) return;
+    data.locations = data.locations.filter(l => l.id !== loc.id);
+    expandedLocations.delete(loc.id);
+    saveData(); zonesEditView(expandedLocations); showToast("Ubicación eliminada");
   }));
 }
 function personalizationView() {
@@ -1101,6 +1176,7 @@ function route() {
   if (section === "c") { const c = containerByUid(id); return c ? containerView(c.id) : notFound(); }
   if (section === "item") { const parts = raw.split("/"); return itemView(parts[1], parts[2]); }
   if (section === "edit") return editView(id);
+  if (section === "move") return moveContainerView(id);
   return notFound();
 }
 

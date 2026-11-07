@@ -1,4 +1,4 @@
-const CACHE = "mis-archivadores-v0.11.4";
+const CACHE = "mis-archivadores-v0.11.5";
 const ASSETS = [
   "./",
   "./index.html",
