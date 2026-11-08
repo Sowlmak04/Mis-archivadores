@@ -4,7 +4,8 @@
   "description": "PWA personal para localizar objetos guardados en casa mediante una estructura sencilla y configurable. El objetivo es poder saber rápidamente **qué hay guardado y dónde está**, con preparación para sincronización entre dispositivos, fotografías y acceso mediante NFC.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:containers": "node --test tests/containers.test.mjs"
   },
   "repository": {
     "type": "git",
