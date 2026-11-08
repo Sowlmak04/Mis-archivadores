@@ -11,7 +11,7 @@ const mf = new Miniflare(convertV4MiniflareOptions({
   scriptPath: fileURLToPath(new URL("../src/worker.js", import.meta.url)),
   compatibilityDate: "2026-10-06",
   telemetry: { enabled: false },
-  d1Databases: { DB: "containers-tests" },
+  d1Databases: { DB: "containers-tests", MIGRATION_DB: "migration-tests" },
   outboundService: () => new Response("Network disabled in tests", { status: 503 })
 }));
 let db;
@@ -21,13 +21,17 @@ const base = {
 };
 const timestamp = "2020-01-01T00:00:00.000Z";
 
-before(async () => {
-  db = await mf.getD1Database("DB");
-  for (const file of ["0001_initial_schema.sql", "0002_add_inventories.sql"]) {
+async function migrate(database, files) {
+  for (const file of files) {
     const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), "utf8");
     const statements = sql.replace(/^\s*--.*$/gm, "").split(";").map(s => s.trim()).filter(Boolean);
-    await db.batch(statements.map(s => db.prepare(s)));
+    await database.batch(statements.map(s => database.prepare(s)));
   }
+}
+
+before(async () => {
+  db = await mf.getD1Database("DB");
+  await migrate(db, ["0001_initial_schema.sql", "0002_add_inventories.sql", "0003_add_container_version.sql"]);
   await db.batch([
     ...["home-main", "other"].map(id => db.prepare(
       "INSERT INTO inventories VALUES (?1, ?1, ?2, ?2)"
@@ -83,6 +87,8 @@ test("creación sin zona aunque la ubicación tenga zonas; estado 53 -> C054", a
   assert.equal(container.name, "Documentación");
   assert.equal(container.type, "");
   assert.equal(container.note, "");
+  assert.equal(container.version, 1);
+  assert.equal((await db.prepare("SELECT version FROM containers WHERE id = ?1").bind(container.id).first()).version, 1);
 });
 test("creación válida con zona", async () => {
   const response = await request({ ...base, zone_id: "zone-a", type: " Caja ", note: " Nota " });
@@ -142,9 +148,9 @@ test("body vacío", () => expectError(base, 400, "INVALID_BODY", { body: "" }));
 for (const body of [null, [], "text", 3, true]) {
   test(`raíz JSON inválida: ${JSON.stringify(body)}`, () => expectError(body, 400, "INVALID_BODY"));
 }
-for (const field of ["extra", "number", "id", "created_at", "updated_at", "items"]) {
+for (const field of ["extra", "number", "id", "created_at", "updated_at", "items", "version", "expected_version"]) {
   test(`campo inesperado/prohibido: ${field}`, () =>
-    expectError({ ...base, [field]: field === "number" ? 54 : "forbidden" }, 400, "VALIDATION_ERROR"));
+    expectError({ ...base, [field]: field === "number" ? 54 : ["version", "expected_version"].includes(field) ? 1 : "forbidden" }, 400, "VALIDATION_ERROR"));
 }
 for (const field of Object.keys(base)) {
   test(`campo obligatorio: ${field}`, () => {
@@ -194,7 +200,7 @@ test("timestamps del servidor iguales y fila devuelta idéntica a la persistida"
   assert.equal(response.status, 201);
   const { container } = await response.json();
   assert.deepEqual(Object.keys(container).sort(), [
-    "number", "id", "uid", "location_id", "zone_id", "name", "type", "note", "created_at", "updated_at"
+    "number", "id", "uid", "location_id", "zone_id", "name", "type", "note", "created_at", "updated_at", "version"
   ].sort());
   assert.equal(container.created_at, container.updated_at);
   const created = Date.parse(container.created_at);
@@ -222,6 +228,66 @@ test("restricciones SQL: UNIQUE(uid) y FK compuesta siguen activas", async () =>
   await assert.rejects(insert.bind("bad-zone", "zone-b", timestamp).run(), /FOREIGN KEY constraint failed/);
   assert.equal(await count(), 1);
 });
+test("0003 conserva los 53 contenedores existentes, relaciones e items y añade version 1", async () => {
+  const database = await mf.getD1Database("MIGRATION_DB");
+  await migrate(database, ["0001_initial_schema.sql", "0002_add_inventories.sql"]);
+  await database.batch([
+    database.prepare("INSERT INTO inventories VALUES ('inventory', 'Inventario', ?1, ?1)").bind(timestamp),
+    database.prepare("INSERT INTO locations VALUES ('location', 'inventory', 'Casa', ?1, ?1)").bind(timestamp),
+    database.prepare("INSERT INTO zones VALUES ('zone', 'location', 'Zona', ?1, ?1)").bind(timestamp),
+    ...Array.from({ length: 53 }, (_, index) => database.prepare(`
+      INSERT INTO containers
+        (number, uid, location_id, zone_id, name, type, note, created_at, updated_at)
+      VALUES (?1, ?2, 'location', ?3, ?4, ?5, ?6, ?7, ?8)
+    `).bind(index + 1, `uid-${index}`, index % 2 ? 'zone' : null,
+      `Nombre ${index}`, `Tipo ${index}`, `Nota ${index}`, timestamp, '2021-02-03T04:05:06.000Z')),
+    ...Array.from({ length: 53 }, (_, index) => database.prepare(`
+      INSERT INTO items VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    `).bind(`item-${index}`, `C${String(index + 1).padStart(3, '0')}`,
+      `Item ${index}`, `Nota item ${index}`, index, timestamp, '2022-02-03T04:05:06.000Z'))
+  ]);
+  const tables = ['inventories', 'locations', 'zones', 'containers', 'items', 'sqlite_sequence'];
+  const snapshot = async () => Promise.all(tables.map(async table =>
+    (await database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()).results));
+  const beforeMigration = await snapshot();
+  await migrate(database, ["0003_add_container_version.sql"]);
+  const afterMigration = await snapshot();
+  const containersIndex = tables.indexOf('containers');
+  assert.equal(afterMigration[containersIndex].length, 53);
+  afterMigration[containersIndex] = afterMigration[containersIndex].map(({ version, ...unchanged }) => {
+    assert.equal(version, 1);
+    return unchanged;
+  });
+  assert.deepEqual(afterMigration, beforeMigration);
+});
+
+test("GET devuelve la version persistida sin cambiar el resto del contenedor", async () => {
+  await db.prepare("UPDATE containers SET version = 7 WHERE uid = 'seed'").run();
+  const response = await mf.dispatchFetch("http://localhost/api/data?inventory_id=home-main");
+  assert.equal(response.status, 200);
+  const data = await response.json();
+  assert.equal(data.containers.length, 1);
+  assert.equal(data.containers[0].version, 7);
+  assert.deepEqual(data.containers[0], await db.prepare("SELECT * FROM containers WHERE uid = 'seed'").first());
+});
+
+for (const [label, value] of [
+  ['cero', 0], ['negativo', -1], ['decimal', 1.5], ['texto', 'invalid'],
+  ['fuera del rango seguro', 9007199254740992], ['null', null]
+]) {
+  test(`version SQL rechaza ${label} sin alterar la fila`, async () => {
+    const original = await db.prepare("SELECT * FROM containers WHERE uid = 'seed'").first();
+    await assert.rejects(db.prepare("UPDATE containers SET version = ?1 WHERE uid = 'seed'").bind(value).run(),
+      /(?:CHECK|NOT NULL) constraint failed/);
+    assert.deepEqual(await db.prepare("SELECT * FROM containers WHERE uid = 'seed'").first(), original);
+  });
+}
+
+test("version SQL admite el máximo entero seguro", async () => {
+  await db.prepare("UPDATE containers SET version = ?1 WHERE uid = 'seed'").bind(Number.MAX_SAFE_INTEGER).run();
+  assert.equal((await db.prepare("SELECT version FROM containers WHERE uid = 'seed'").first()).version, Number.MAX_SAFE_INTEGER);
+});
+
 test("cabeceras de las otras respuestas API existentes", async () => {
   for (const path of ["/api/health", "/api/db-health", "/api/data", "/api/data?inventory_id=home-main"]) {
     const response = await mf.dispatchFetch(`http://localhost${path}`);

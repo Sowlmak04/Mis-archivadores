@@ -74,7 +74,7 @@ async function createContainer(request, env) {
         ))
         AND NOT EXISTS (SELECT 1 FROM containers WHERE uid = ?4)
         RETURNING number, id, uid, location_id, zone_id,
-                  name, type, note, created_at, updated_at
+                  name, type, note, created_at, updated_at, version
       `).bind(...identifiers, body.name.trim(), body.type, body.note, timestamp)
     ]);
 
@@ -226,7 +226,7 @@ export default {
           `
             SELECT
               c.number, c.id, c.uid, c.location_id, c.zone_id,
-              c.name, c.type, c.note, c.created_at, c.updated_at
+              c.name, c.type, c.note, c.created_at, c.updated_at, c.version
             FROM containers AS c
             JOIN locations AS l ON l.id = c.location_id
             WHERE l.inventory_id = ?1
