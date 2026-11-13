@@ -111,9 +111,101 @@ async function createContainer(request, env) {
   }
 }
 
+async function patchContainer(request, env, url, id) {
+  if (request.method !== "PATCH") {
+    return apiError(405, "METHOD_NOT_ALLOWED", "Solo se permite el método PATCH.", { Allow: "PATCH" });
+  }
+  if (!/^C[0-9]{3,}$/.test(id)) {
+    return apiError(400, "INVALID_CONTAINER_ID", "El identificador del contenedor no es válido.");
+  }
+  const inventoryIds = url.searchParams.getAll("inventory_id");
+  if (inventoryIds.length !== 1 || !inventoryIds[0] || inventoryIds[0] !== inventoryIds[0].trim()) {
+    return apiError(400, "INVALID_INVENTORY_ID", "Se requiere exactamente un inventory_id válido.");
+  }
+  const mediaType = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+  if (mediaType !== "application/json") {
+    return apiError(415, "UNSUPPORTED_MEDIA_TYPE", "Se requiere Content-Type application/json.");
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return apiError(400, "INVALID_BODY", "El body debe contener JSON válido.");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return apiError(400, "INVALID_BODY", "El body debe ser un objeto JSON.");
+  }
+  // SQL identifiers come exclusively from this fixed allowlist.
+  const editable = ["name", "type", "note"];
+  const fields = editable.filter(field => Object.hasOwn(body, field));
+  if (
+    Object.keys(body).some(field => !["expected_version", ...editable].includes(field)) ||
+    !Number.isSafeInteger(body.expected_version) || body.expected_version < 1 ||
+    fields.length === 0 || fields.some(field => typeof body[field] !== "string") ||
+    (Object.hasOwn(body, "name") && !body.name.trim())
+  ) {
+    return apiError(400, "VALIDATION_ERROR", "Campos ausentes, inesperados o con valores inválidos.");
+  }
+  const inventoryId = inventoryIds[0];
+  try {
+    const values = fields.map(field => field === "name" ? body[field].trim() : body[field]);
+    const columns = "number, id, uid, location_id, zone_id, name, type, note, created_at, updated_at, version";
+    // D1 batch is transactional: the conditional UPDATE decides success, and
+    // the following scoped read supplies a consistent current row on conflict.
+    const [inventory, update, current] = await env.DB.batch([
+      env.DB.prepare("SELECT id FROM inventories WHERE id = ?").bind(inventoryId),
+      env.DB.prepare(`
+        UPDATE containers
+        SET ${fields.map(field => `${field} = ?`).join(", ")},
+            updated_at = ?, version = version + 1
+        WHERE id = ? AND version = ?
+          AND EXISTS (
+            SELECT 1 FROM locations
+            WHERE locations.id = containers.location_id
+              AND locations.inventory_id = ?
+          )
+        RETURNING ${columns}
+      `).bind(...values, new Date().toISOString(), id, body.expected_version, inventoryId),
+      env.DB.prepare(`
+        SELECT ${columns} FROM containers
+        WHERE id = ? AND EXISTS (
+          SELECT 1 FROM locations
+          WHERE locations.id = containers.location_id AND locations.inventory_id = ?
+        )
+      `).bind(id, inventoryId)
+    ]);
+    if ([inventory, update, current].some(result => !result.success)) {
+      throw new Error("Unexpected D1 batch result");
+    }
+    if (!inventory.results.length) {
+      return apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.");
+    }
+    if (update.results.length === 1) {
+      return apiJson({ container: update.results[0] });
+    }
+    if (!current.results.length) {
+      return apiError(404, "CONTAINER_NOT_FOUND", "El contenedor no existe en ese inventario.");
+    }
+    return apiJson({
+      error: { code: "VERSION_CONFLICT", message: "El contenedor ha cambiado desde que lo leíste." },
+      current_container: current.results[0]
+    }, 409);
+  } catch (error) {
+    const message = String(error?.cause?.message || error?.message || "");
+    if (/(?:UNIQUE|PRIMARY KEY|FOREIGN KEY|CHECK|NOT NULL) constraint failed/.test(message)) {
+      return apiError(409, "CONTAINER_CONFLICT", "No se pudo actualizar el contenedor por un conflicto de integridad.");
+    }
+    return apiError(500, "INTERNAL_ERROR", "No se pudo actualizar el contenedor.");
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/api/containers/")) {
+      return patchContainer(request, env, url, url.pathname.slice("/api/containers/".length));
+    }
 
     if (url.pathname === "/api/containers") {
       return createContainer(request, env);

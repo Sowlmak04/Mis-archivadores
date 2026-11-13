@@ -296,3 +296,146 @@ test("cabeceras de las otras respuestas API existentes", async () => {
     await response.text();
   }
 });
+
+// PATCH integration tests exercise the real Worker against ephemeral local D1.
+async function seedPatch(zone = null) {
+  await db.prepare("UPDATE containers SET version = 4, zone_id = ? WHERE id = 'C053'").bind(zone).run();
+  await db.prepare("INSERT INTO items VALUES ('patch-item', 'C053', 'Item', 'Note', 2, ?1, ?1)").bind(timestamp).run();
+}
+const row = () => db.prepare("SELECT * FROM containers WHERE id = 'C053'").first();
+const items = async () => (await db.prepare("SELECT * FROM items ORDER BY id").all()).results;
+async function patch(body = { expected_version: 4, name: "New" }, options = {}) {
+  const { path = "C053?inventory_id=home-main", ...init } = options;
+  const response = await mf.dispatchFetch(`http://localhost/api/containers/${path}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body), ...init
+  });
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  return response;
+}
+async function patchError(body, status, code, options) {
+  const original = await row();
+  const originalItems = await items();
+  const response = await patch(body, options);
+  assert.equal(response.status, status);
+  const result = await response.json();
+  assert.equal(result.error.code, code);
+  assert.deepEqual(await row(), original);
+  assert.deepEqual(await items(), originalItems);
+  if (code === "VERSION_CONFLICT") {
+    assert.deepEqual(result.current_container, original);
+    assert.equal(result.error.message, "El contenedor ha cambiado desde que lo leíste.");
+  } else assert.deepEqual(Object.keys(result), ["error"]);
+  return result;
+}
+for (const zone of [null, "zone-a"]) {
+  for (const change of [{ name: "  Nuevo  " }, { type: "" }, { note: "" },
+    { name: "Several", type: " Type ", note: " Note " }, { name: "Seed" }]) {
+    test(`PATCH updates ${JSON.stringify(change)} zone=${zone}, preserves identity/items`, async () => {
+      await seedPatch(zone);
+      const original = await row();
+      const originalItems = await items();
+      const start = Date.now();
+      const response = await patch({ expected_version: 4, ...change });
+      const end = Date.now();
+      assert.equal(response.status, 200);
+      const { container } = await response.json();
+      const expected = { ...original, ...change, version: 5, updated_at: container.updated_at };
+      if (change.name) expected.name = change.name.trim();
+      assert.deepEqual(container, expected);
+      assert.deepEqual(await row(), container);
+      assert.deepEqual(await items(), originalItems);
+      assert.notEqual(container.updated_at, original.updated_at);
+      assert.ok(Date.parse(container.updated_at) >= start && Date.parse(container.updated_at) <= end);
+      await patchError({ expected_version: 4, ...change }, 409, "VERSION_CONFLICT");
+    });
+  }
+}
+for (const version of [undefined, "4", 1.5, 0, -1, Number.MAX_SAFE_INTEGER + 1, null, true]) {
+  test(`PATCH rejects version ${version}`, () => patchError({ expected_version: version, name: "New" }, 400, "VALIDATION_ERROR"));
+}
+for (const body of [{ expected_version: 1 }, {}, { expected_version: 1, name: " " },
+  { expected_version: 1, name: "" }, ...["name", "type", "note"].flatMap(field =>
+    [null, 3, false, [], {}].map(value => ({ expected_version: 1, [field]: value })))]) {
+  test(`PATCH invalid fields ${JSON.stringify(body)}`, () => patchError(body, 400, "VALIDATION_ERROR"));
+}
+for (const field of ["extra", "version", "uid", "number", "id", "location_id", "zone_id", "created_at", "updated_at", "items"]) {
+  test(`PATCH forbidden ${field}`, () => patchError({ expected_version: 1, name: "New", [field]: 1 }, 400, "VALIDATION_ERROR"));
+}
+for (const id of ["c053", "C53", "C05x", "C053x", "C-053", "C053/", "C%30%35%33", "C053%20"]) {
+  test(`PATCH invalid id ${id}`, () => patchError(undefined, 400, "INVALID_CONTAINER_ID", { path: `${id}?inventory_id=home-main` }));
+}
+for (const query of ["", "?inventory_id=", "?inventory_id=%20", "?inventory_id=%20home-main", "?inventory_id=home-main%20", "?inventory_id=home-main&inventory_id=home-main"]) {
+  test(`PATCH invalid inventory ${query}`, () => patchError(undefined, 400, "INVALID_INVENTORY_ID", { path: `C053${query}` }));
+}
+for (const [path, code] of [["C053?inventory_id=missing", "INVENTORY_NOT_FOUND"],
+  ["C054?inventory_id=home-main", "CONTAINER_NOT_FOUND"], ["C053?inventory_id=other", "CONTAINER_NOT_FOUND"],
+  ["C001?inventory_id=home-main", "CONTAINER_NOT_FOUND"], ["C1000?inventory_id=home-main", "CONTAINER_NOT_FOUND"]]) {
+  test(`PATCH scoped not found ${path}`, () => patchError(undefined, 404, code, { path }));
+}
+for (const version of [1, 3, 5, Number.MAX_SAFE_INTEGER]) {
+  test(`PATCH conflicting version ${version}`, async () => {
+    await seedPatch();
+    await patchError({ expected_version: version, note: "Changed" }, 409, "VERSION_CONFLICT");
+  });
+}
+for (const changes of [[{ name: "A" }, { name: "B" }], [{ type: "A" }, { note: "B" }]]) {
+  test(`PATCH concurrent ${JSON.stringify(changes)}`, async () => {
+    await seedPatch("zone-a");
+    const original = await row();
+    const originalItems = await items();
+    const responses = await Promise.all(changes.map(change => patch({ expected_version: 4, ...change })));
+    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+    const winner = (await responses.find(r => r.status === 200).json()).container;
+    const loser = await responses.find(r => r.status === 409).json();
+    assert.equal(loser.error.code, "VERSION_CONFLICT");
+    assert.deepEqual(loser.current_container, winner);
+    assert.deepEqual(await row(), winner);
+    assert.equal(winner.version, 5);
+    const winnerIndex = responses.findIndex(r => r.status === 200);
+    assert.deepEqual(winner, { ...original, ...changes[winnerIndex], version: 5, updated_at: winner.updated_at });
+    assert.deepEqual(await items(), originalItems);
+  });
+}
+for (const body of [null, [], "text", 3, true]) {
+  test(`PATCH invalid JSON root ${JSON.stringify(body)}`, () => patchError(body, 400, "INVALID_BODY"));
+}
+for (const body of ["{", ""]) {
+  test(`PATCH invalid JSON ${body}`, () => patchError(undefined, 400, "INVALID_BODY", { body }));
+}
+for (const contentType of [null, "text/plain", "application/jsonp"]) {
+  test(`PATCH content type ${contentType}`, () => patchError(undefined, 415, "UNSUPPORTED_MEDIA_TYPE", {
+    headers: contentType ? { "Content-Type": contentType } : {}
+  }));
+}
+test("PATCH accepts JSON charset", async () => {
+  assert.equal((await patch({ expected_version: 1, type: "box" }, {
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  })).status, 200);
+});
+for (const method of ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]) {
+  test(`PATCH route disallows ${method}`, async () => {
+    const original = await row();
+    const response = await patch(undefined, { method, body: undefined });
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get("Allow"), "PATCH");
+    if (method !== "HEAD") assert.equal((await response.json()).error.code, "METHOD_NOT_ALLOWED");
+    assert.deepEqual(await row(), original);
+  });
+}
+for (const [detail, status, code] of [["private SQL details", 500, "INTERNAL_ERROR"],
+  ["CHECK constraint failed: private_test", 409, "CONTAINER_CONFLICT"]]) {
+  test(`PATCH SQL failure rollback ${code}`, async () => {
+    await seedPatch();
+    // Fail after the write to verify the entire statement/transaction rolls back.
+    await db.prepare(`CREATE TRIGGER test_failure AFTER UPDATE ON containers
+      BEGIN UPDATE items SET name = 'Damaged'; SELECT RAISE(ABORT, '${detail}'); END`).run();
+    const result = await patchError(undefined, status, code);
+    assert.ok(!JSON.stringify(result).includes("private"));
+  });
+}
+test("PATCH version overflow is an integrity conflict with rollback", async () => {
+  await db.prepare("UPDATE containers SET version = ? WHERE id = 'C053'").bind(Number.MAX_SAFE_INTEGER).run();
+  await patchError({ expected_version: Number.MAX_SAFE_INTEGER, name: "New" }, 409, "CONTAINER_CONFLICT");
+});
