@@ -3,13 +3,23 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { after, before, beforeEach, test } from "node:test";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import { build } from "esbuild";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
+
+const workerPath = fileURLToPath(new URL("../src/worker.js", import.meta.url));
+const bundleWorker = async source => (await build({
+  stdin: { contents: source, resolveDir: fileURLToPath(new URL("../src", import.meta.url)), sourcefile: "worker.js" },
+  bundle: true, write: false, format: "esm", platform: "browser"
+})).outputFiles[0].text;
+const workerSource = await readFile(workerPath, "utf8");
+const productionScript = await bundleWorker(workerSource);
 
 // Uses Wrangler's installed Miniflare, with ephemeral D1 only. No Wrangler
 // configuration, remote bindings, R2, or existing local database is loaded.
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true,
-  script: (await readFile(new URL("../src/worker.js", import.meta.url), "utf8")).replace(
-    "export default createWorker();",
+  script: await bundleWorker(workerSource.replace(
+    "export default createWorker(getCloudflareAccessIdentity);",
     `const testWorker = createWorker(async request => {
       const subject = request.headers.get("x-test-identity") ?? "user-a";
       return subject === "unauthenticated" ? null : { provider: "test", issuer: "local", subject };
@@ -27,7 +37,7 @@ const mf = new Miniflare(convertV4MiniflareOptions({
       };
       return testWorker.fetch(request, { ...env, DB: wrapped });
     } };`
-  ),
+  )),
   compatibilityDate: "2026-10-06",
   telemetry: { enabled: false },
   d1Databases: { DB: "containers-tests", MIGRATION_DB: "migration-tests" },
@@ -720,7 +730,7 @@ test("revocación anterior al batch impide POST, PATCH y move", async () => {
 
 test("Worker sin proveedor rechaza cabeceras de identidad sintética", async () => {
   const isolated = new Miniflare(convertV4MiniflareOptions({
-    modules: true, scriptPath: fileURLToPath(new URL("../src/worker.js", import.meta.url)),
+    modules: true, script: productionScript,
     compatibilityDate: "2026-10-06", telemetry: { enabled: false }
   }));
   try {
@@ -736,4 +746,77 @@ test("0004 impone roles, unicidad y claves foráneas", async () => {
   await assert.rejects(db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'missing', 'viewer', ?1, ?1)").bind(timestamp).run(), /FOREIGN KEY constraint failed/);
   await assert.rejects(db.prepare("INSERT INTO user_identities VALUES ('duplicate', 'user-c', 'test', 'local', 'user-a', ?1, ?1)").bind(timestamp).run(), /UNIQUE constraint failed/);
   await assert.rejects(db.prepare("DELETE FROM users WHERE id = 'user-a'").run(), /FOREIGN KEY constraint failed/);
+});
+
+const accessModule = await import(`data:text/javascript;base64,${Buffer.from(productionScript).toString("base64")}`);
+const accessIssuer = "https://example.cloudflareaccess.com";
+const accessAudience = "test-audience";
+const accessEnv = { TEAM_DOMAIN: accessIssuer, POLICY_AUD: accessAudience };
+const signingKeys = await generateKeyPair("RS256");
+const otherKeys = await generateKeyPair("RS256");
+const publicJwk = { ...await exportJWK(signingKeys.publicKey), kid: "test-key", alg: "RS256" };
+const localKeys = createLocalJWKSet({ keys: [publicJwk] });
+const accessProvider = (request, env) => accessModule.getCloudflareAccessIdentity(request, env, () => localKeys);
+const accessWorker = accessModule.createWorker(accessProvider);
+const makeToken = async (changes = {}, key = signingKeys.privateKey, header = {}) => {
+  const claims = { iss: accessIssuer, sub: "access-owner", aud: accessAudience,
+    exp: Math.floor(Date.now() / 1000) + 300, ...changes };
+  for (const name of Object.keys(claims)) if (claims[name] === undefined) delete claims[name];
+  return new SignJWT(claims).setProtectedHeader({ alg: "RS256", kid: "test-key", ...header }).sign(key);
+};
+const accessRequest = (token, path = "/api/data?inventory_id=inventory-a", init = {}) =>
+  new Request(`http://localhost${path}`, { ...init, headers: { ...(token ? { "Cf-Access-Jwt-Assertion": token } : {}), ...init.headers } });
+
+test("Access JWT: firma, claims, configuración y entradas inválidas fallan cerrados", async () => {
+  const valid = await makeToken();
+  assert.deepEqual(await accessProvider(accessRequest(valid), accessEnv),
+    { provider: "cloudflare-access", issuer: accessIssuer, subject: "access-owner" });
+  const parts = valid.split(".");
+  const manipulated = `${Buffer.from(JSON.stringify({ alg: "RS256", kid: "test-key", extra: true })).toString("base64url")}.${parts[1]}.${parts[2]}`;
+  const cases = [
+    [null, accessEnv], [await makeToken({}, otherKeys.privateKey), accessEnv],
+    [await makeToken({ iss: "https://wrong.example" }), accessEnv],
+    [await makeToken({ aud: "wrong" }), accessEnv],
+    [await makeToken({ exp: 1 }), accessEnv],
+    [await makeToken({ nbf: Math.floor(Date.now() / 1000) + 300 }), accessEnv],
+    [await makeToken({ sub: undefined }), accessEnv], [await makeToken({ iss: undefined }), accessEnv],
+    [await makeToken({ aud: undefined }), accessEnv], [await makeToken({ exp: undefined }), accessEnv],
+    [valid, { POLICY_AUD: accessAudience }], [valid, { TEAM_DOMAIN: accessIssuer }],
+    [manipulated, accessEnv], ["not.a.jwt", accessEnv],
+    [await makeToken({}, signingKeys.privateKey, { kid: "unknown" }), accessEnv]
+  ];
+  for (const [token, env] of cases) {
+    const response = await accessWorker.fetch(accessRequest(token), env);
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: { code: "UNAUTHENTICATED", message: "Autenticación requerida." } });
+  }
+});
+
+test("Access JWT y membership D1 son capas separadas", async () => {
+  await db.batch([
+    db.prepare("INSERT INTO user_identities VALUES ('access-owner', 'user-a', 'cloudflare-access', ?1, 'access-owner', ?2, ?2)").bind(accessIssuer, timestamp),
+    db.prepare("INSERT INTO user_identities VALUES ('access-viewer', 'user-b', 'cloudflare-access', ?1, 'access-viewer', ?2, ?2)").bind(accessIssuer, timestamp)
+  ]);
+  try {
+    const env = { ...accessEnv, DB: db };
+    const owner = await makeToken();
+    const viewer = await makeToken({ sub: "access-viewer" });
+    const unknown = await makeToken({ sub: "unregistered" });
+    let response = await accessWorker.fetch(accessRequest(unknown), env);
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "USER_NOT_REGISTERED");
+    response = await accessWorker.fetch(accessRequest(owner), env);
+    assert.equal(response.status, 200);
+    response = await accessWorker.fetch(accessRequest(owner, "/api/data?inventory_id=inventory-b"), env);
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "INVENTORY_NOT_FOUND");
+    response = await accessWorker.fetch(accessRequest(viewer, "/api/containers", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inventory_id: "inventory-a", uid: "access-viewer", location_id: "inventory-a-location", zone_id: null, name: "A", type: "", note: "" })
+    }), env);
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "FORBIDDEN");
+  } finally {
+    await db.prepare("DELETE FROM user_identities WHERE id IN ('access-owner', 'access-viewer')").run();
+  }
 });

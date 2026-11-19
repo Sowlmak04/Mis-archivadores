@@ -1,3 +1,36 @@
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
+// Reuse jose's remote key set and its rotation-aware cache within this isolate.
+let remoteKeySet;
+let remoteTeamDomain;
+function accessKeySet(teamDomain) {
+  if (!remoteKeySet || remoteTeamDomain !== teamDomain) {
+    remoteKeySet = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+    remoteTeamDomain = teamDomain;
+  }
+  return remoteKeySet;
+}
+
+export async function getCloudflareAccessIdentity(request, env, getKeySet = accessKeySet) {
+  const { TEAM_DOMAIN, POLICY_AUD } = env;
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (typeof TEAM_DOMAIN !== "string" || !TEAM_DOMAIN ||
+      typeof POLICY_AUD !== "string" || !POLICY_AUD || !token) return null;
+  try {
+    const domain = new URL(TEAM_DOMAIN);
+    if (domain.protocol !== "https:" || domain.origin !== TEAM_DOMAIN ||
+        domain.username || domain.password) return null;
+    const { payload } = await jwtVerify(token, getKeySet(TEAM_DOMAIN), {
+      issuer: TEAM_DOMAIN, audience: POLICY_AUD, algorithms: ["RS256"],
+      requiredClaims: ["iss", "sub", "aud", "exp"]
+    });
+    if (typeof payload.sub !== "string" || !payload.sub.trim()) return null;
+    return { provider: "cloudflare-access", issuer: payload.iss, subject: payload.sub };
+  } catch {
+    return null;
+  }
+}
+
 const apiJson = (body, status = 200, extraHeaders = {}) =>
   Response.json(body, {
     status,
@@ -11,8 +44,7 @@ const apiJson = (body, status = 200, extraHeaders = {}) =>
 const apiError = (status, code, message, headers) =>
   apiJson({ error: { code, message } }, status, headers);
 
-// Identity must be supplied by a trusted adapter; the default has none.
-// Never derive it from a client-controlled header here.
+// Identity must be supplied by a trusted adapter.
 async function requireInventoryAccess(env, identity, inventoryId, permission) {
   if (!identity || ![identity.provider, identity.issuer, identity.subject].every(
     value => typeof value === "string" && value.length > 0
@@ -537,4 +569,4 @@ export function createWorker(getAuthenticatedIdentity = async () => null) {
   };
 }
 
-export default createWorker();
+export default createWorker(getCloudflareAccessIdentity);
