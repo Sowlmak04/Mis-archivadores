@@ -439,3 +439,129 @@ test("PATCH version overflow is an integrity conflict with rollback", async () =
   await db.prepare("UPDATE containers SET version = ? WHERE id = 'C053'").bind(Number.MAX_SAFE_INTEGER).run();
   await patchError({ expected_version: Number.MAX_SAFE_INTEGER, name: "New" }, 409, "CONTAINER_CONFLICT");
 });
+
+async function move(body = { expected_version: 4, location_id: "home-b", zone_id: null }, options = {}) {
+  const { path = "C053/move?inventory_id=home-main", ...init } = options;
+  const response = await mf.dispatchFetch(`http://localhost/api/containers/${path}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), ...init
+  });
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  return response;
+}
+async function moveError(body, status, code, options) {
+  const original = await row();
+  const originalItems = await items();
+  const response = await move(body, options);
+  assert.equal(response.status, status);
+  const result = await response.json();
+  assert.equal(result.error.code, code);
+  if (code === "VERSION_CONFLICT") {
+    assert.deepEqual(result.current_container, original);
+    assert.equal(result.error.message, "El contenedor ha cambiado desde que lo leíste.");
+  } else assert.deepEqual(Object.keys(result), ["error"]);
+  assert.deepEqual(await row(), original);
+  assert.deepEqual(await items(), originalItems);
+  return result;
+}
+for (const [initial, location, zone] of [
+  ["zone-a", "home-b", "zone-b"], ["zone-a", "home-a", null],
+  [null, "home-a", "zone-a"], [null, "home-b", null],
+  [null, "home-b", "zone-b"], ["zone-a", "home-a", "zone-a"]
+]) {
+  test(`move ${initial} to ${location}/${zone} preserves identity, content and items`, async () => {
+    await seedPatch(initial);
+    const original = await row();
+    const originalItems = await items();
+    const response = await move({ expected_version: 4, location_id: location, zone_id: zone });
+    assert.equal(response.status, 200);
+    const { container } = await response.json();
+    assert.deepEqual(container, { ...original, location_id: location, zone_id: zone, updated_at: container.updated_at, version: 5 });
+    assert.notEqual(container.updated_at, original.updated_at);
+    assert.deepEqual(await row(), container);
+    assert.deepEqual(await items(), originalItems);
+  });
+}
+for (const [location, zone, status, code] of [
+  ["missing", null, 404, "LOCATION_NOT_FOUND"], ["other-a", null, 404, "LOCATION_NOT_FOUND"],
+  ["home-a", "missing", 404, "ZONE_NOT_FOUND"], ["home-a", "zone-b", 400, "ZONE_LOCATION_MISMATCH"]
+]) {
+  test(`move invalid destination ${location}/${zone}`, () => moveError({ expected_version: 1, location_id: location, zone_id: zone }, status, code));
+}
+test("move treats zone in another inventory as not found", async () => {
+  await db.prepare("INSERT INTO zones VALUES ('other-zone', 'other-a', 'Other', ?1, ?1)").bind(timestamp).run();
+  try { await moveError({ expected_version: 1, location_id: "home-a", zone_id: "other-zone" }, 404, "ZONE_NOT_FOUND"); }
+  finally { await db.prepare("DELETE FROM zones WHERE id = 'other-zone'").run(); }
+});
+for (const field of ["expected_version", "location_id", "zone_id"]) {
+  test(`move missing ${field}`, () => {
+    const body = { expected_version: 1, location_id: "home-a", zone_id: null };
+    delete body[field];
+    return moveError(body, 400, "VALIDATION_ERROR");
+  });
+}
+for (const value of [0, -1, 1.5, "4", null, true, Number.MAX_SAFE_INTEGER + 1]) {
+  test(`move invalid version ${value}`, () => moveError({ expected_version: value, location_id: "home-a", zone_id: null }, 400, "VALIDATION_ERROR"));
+}
+for (const field of ["location_id", "zone_id"]) for (const value of ["", " ", " home-a", "home-a ", 1, false, [], {}]) {
+  test(`move invalid ${field} ${JSON.stringify(value)}`, () => moveError({ expected_version: 1, location_id: "home-a", zone_id: null, [field]: value }, 400, "VALIDATION_ERROR"));
+}
+for (const field of ["name", "type", "note", "id", "uid", "number", "version", "created_at", "updated_at", "items", "extra"]) {
+  test(`move rejects ${field}`, () => moveError({ expected_version: 1, location_id: "home-a", zone_id: null, [field]: "x" }, 400, "VALIDATION_ERROR"));
+}
+for (const id of ["c053", "C53", "C053x", "C%30%35%33", "C053/extra"]) {
+  test(`move invalid id ${id}`, () => moveError(undefined, 400, "INVALID_CONTAINER_ID", { path: `${id}/move?inventory_id=home-main` }));
+}
+for (const query of ["", "?inventory_id=", "?inventory_id=%20", "?inventory_id=%20home-main", "?inventory_id=home-main%20", "?inventory_id=home-main&inventory_id=other"]) {
+  test(`move invalid inventory ${query}`, () => moveError(undefined, 400, "INVALID_INVENTORY_ID", { path: `C053/move${query}` }));
+}
+for (const [path, code] of [["C053/move?inventory_id=missing", "INVENTORY_NOT_FOUND"], ["C054/move?inventory_id=home-main", "CONTAINER_NOT_FOUND"], ["C053/move?inventory_id=other", "CONTAINER_NOT_FOUND"]]) {
+  test(`move scoped ${path}`, () => moveError(undefined, 404, code, { path }));
+}
+for (const version of [3, 5]) {
+  test(`move version conflict ${version}`, async () => {
+    await seedPatch("zone-a");
+    await moveError({ expected_version: version, location_id: "home-b", zone_id: null }, 409, "VERSION_CONFLICT");
+  });
+}
+for (const kind of ["move", "edit"]) {
+  test(`concurrent move and ${kind}: one winner`, async () => {
+    await seedPatch("zone-a");
+    const original = await row();
+    const originalItems = await items();
+    const responses = await Promise.all([
+      move(), kind === "move" ? move({ expected_version: 4, location_id: "home-b", zone_id: "zone-b" }) : patch({ expected_version: 4, name: "Concurrent" })
+    ]);
+    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+    const winner = (await responses.find(r => r.status === 200).json()).container;
+    const loser = await responses.find(r => r.status === 409).json();
+    assert.equal(loser.error.code, "VERSION_CONFLICT");
+    assert.deepEqual(loser.current_container, winner);
+    assert.deepEqual(await row(), winner);
+    assert.equal(winner.version, 5);
+    for (const key of ["number", "id", "uid", "type", "note", "created_at"]) assert.equal(winner[key], original[key]);
+    assert.deepEqual(await items(), originalItems);
+  });
+}
+for (const body of [null, [], "text", 3, true]) test(`move invalid root ${JSON.stringify(body)}`, () => moveError(body, 400, "INVALID_BODY"));
+for (const body of ["{", ""]) test(`move malformed JSON ${body}`, () => moveError(undefined, 400, "INVALID_BODY", { body }));
+for (const contentType of [null, "text/plain", "application/jsonp"]) test(`move content type ${contentType}`, () => moveError(undefined, 415, "UNSUPPORTED_MEDIA_TYPE", { headers: contentType ? { "Content-Type": contentType } : {} }));
+for (const method of ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]) {
+  test(`move method ${method}`, async () => {
+    const original = await row();
+    const response = await move(undefined, { method, body: undefined });
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get("Allow"), "PATCH");
+    if (method !== "HEAD") assert.equal((await response.json()).error.code, "METHOD_NOT_ALLOWED");
+    assert.deepEqual(await row(), original);
+  });
+}
+for (const [detail, status, code] of [["private SQL details", 500, "INTERNAL_ERROR"], ["CHECK constraint failed: private_test", 409, "CONTAINER_CONFLICT"]]) {
+  test(`move SQL failure rollback ${code}`, async () => {
+    await seedPatch();
+    await db.prepare(`CREATE TRIGGER test_failure AFTER UPDATE ON containers
+      BEGIN UPDATE items SET name = 'Damaged'; SELECT RAISE(ABORT, '${detail}'); END`).run();
+    const result = await moveError(undefined, status, code);
+    assert.ok(!JSON.stringify(result).includes("private"));
+  });
+}

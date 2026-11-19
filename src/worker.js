@@ -199,9 +199,95 @@ async function patchContainer(request, env, url, id) {
   }
 }
 
+async function moveContainer(request, env, url, id) {
+  if (request.method !== "PATCH") {
+    return apiError(405, "METHOD_NOT_ALLOWED", "Solo se permite el método PATCH.", { Allow: "PATCH" });
+  }
+  if (!/^C[0-9]{3,}$/.test(id)) {
+    return apiError(400, "INVALID_CONTAINER_ID", "El identificador del contenedor no es válido.");
+  }
+  const inventoryIds = url.searchParams.getAll("inventory_id");
+  if (inventoryIds.length !== 1 || !inventoryIds[0] || inventoryIds[0] !== inventoryIds[0].trim()) {
+    return apiError(400, "INVALID_INVENTORY_ID", "Se requiere exactamente un inventory_id válido.");
+  }
+  const mediaType = request.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+  if (mediaType !== "application/json") {
+    return apiError(415, "UNSUPPORTED_MEDIA_TYPE", "Se requiere Content-Type application/json.");
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return apiError(400, "INVALID_BODY", "El body debe contener JSON válido.");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return apiError(400, "INVALID_BODY", "El body debe ser un objeto JSON.");
+  }
+  const fields = ["expected_version", "location_id", "zone_id"];
+  const validId = value => typeof value === "string" && value.length > 0 && value === value.trim();
+  if (Object.keys(body).some(key => !fields.includes(key)) ||
+      fields.some(key => !Object.hasOwn(body, key)) ||
+      !Number.isSafeInteger(body.expected_version) || body.expected_version < 1 ||
+      !validId(body.location_id) || (body.zone_id !== null && !validId(body.zone_id))) {
+    return apiError(400, "VALIDATION_ERROR", "Campos ausentes, inesperados o con valores inválidos.");
+  }
+  const inventoryId = inventoryIds[0];
+  const columns = "number, id, uid, location_id, zone_id, name, type, note, created_at, updated_at, version";
+  try {
+    // D1 executes the checks, guarded update and scoped conflict read atomically.
+    const [validation, update, current] = await env.DB.batch([
+      env.DB.prepare(`
+        SELECT EXISTS(SELECT 1 FROM inventories WHERE id = ?1) AS inventory_exists,
+          EXISTS(SELECT 1 FROM locations WHERE id = ?2 AND inventory_id = ?1) AS location_valid,
+          EXISTS(SELECT 1 FROM zones AS z JOIN locations AS l ON l.id = z.location_id
+            WHERE z.id = ?3 AND l.inventory_id = ?1) AS zone_exists,
+          EXISTS(SELECT 1 FROM zones WHERE id = ?3 AND location_id = ?2) AS zone_valid
+      `).bind(inventoryId, body.location_id, body.zone_id),
+      env.DB.prepare(`
+        UPDATE containers
+        SET location_id = ?1, zone_id = ?2, updated_at = ?3, version = version + 1
+        WHERE id = ?4 AND version = ?5
+          AND EXISTS (SELECT 1 FROM locations WHERE id = containers.location_id AND inventory_id = ?6)
+          AND EXISTS (SELECT 1 FROM locations WHERE id = ?1 AND inventory_id = ?6)
+          AND (?2 IS NULL OR EXISTS (SELECT 1 FROM zones WHERE id = ?2 AND location_id = ?1))
+        RETURNING ${columns}
+      `).bind(body.location_id, body.zone_id, new Date().toISOString(), id, body.expected_version, inventoryId),
+      env.DB.prepare(`
+        SELECT ${columns} FROM containers WHERE id = ? AND EXISTS (
+          SELECT 1 FROM locations WHERE id = containers.location_id AND inventory_id = ?
+        )
+      `).bind(id, inventoryId)
+    ]);
+    if ([validation, update, current].some(result => !result.success) || validation.results.length !== 1) {
+      throw new Error("Unexpected D1 batch result");
+    }
+    const checks = validation.results[0];
+    if (!checks.inventory_exists) return apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.");
+    if (!current.results.length) return apiError(404, "CONTAINER_NOT_FOUND", "El contenedor no existe en ese inventario.");
+    if (!checks.location_valid) return apiError(404, "LOCATION_NOT_FOUND", "La ubicación no existe en ese inventario.");
+    if (body.zone_id !== null && !checks.zone_exists) return apiError(404, "ZONE_NOT_FOUND", "La zona no existe.");
+    if (body.zone_id !== null && !checks.zone_valid) return apiError(400, "ZONE_LOCATION_MISMATCH", "La zona no pertenece a la ubicación.");
+    if (update.results.length === 1) return apiJson({ container: update.results[0] });
+    return apiJson({
+      error: { code: "VERSION_CONFLICT", message: "El contenedor ha cambiado desde que lo leíste." },
+      current_container: current.results[0]
+    }, 409);
+  } catch (error) {
+    const message = String(error?.cause?.message || error?.message || "");
+    if (/(?:UNIQUE|PRIMARY KEY|FOREIGN KEY|CHECK|NOT NULL) constraint failed/.test(message)) {
+      return apiError(409, "CONTAINER_CONFLICT", "No se pudo mover el contenedor por un conflicto de integridad.");
+    }
+    return apiError(500, "INTERNAL_ERROR", "No se pudo mover el contenedor.");
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/api/containers/") && url.pathname.endsWith("/move")) {
+      return moveContainer(request, env, url, url.pathname.slice("/api/containers/".length, -"/move".length));
+    }
 
     if (url.pathname.startsWith("/api/containers/")) {
       return patchContainer(request, env, url, url.pathname.slice("/api/containers/".length));
