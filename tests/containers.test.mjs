@@ -8,7 +8,26 @@ import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 // configuration, remote bindings, R2, or existing local database is loaded.
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true,
-  scriptPath: fileURLToPath(new URL("../src/worker.js", import.meta.url)),
+  script: (await readFile(new URL("../src/worker.js", import.meta.url), "utf8")).replace(
+    "export default createWorker();",
+    `const testWorker = createWorker(async request => {
+      const subject = request.headers.get("x-test-identity") ?? "user-a";
+      return subject === "unauthenticated" ? null : { provider: "test", issuer: "local", subject };
+    });
+    export default { async fetch(request, env) {
+      if (!request.headers.has("x-test-revoke")) return testWorker.fetch(request, env);
+      const db = env.DB;
+      const wrapped = {
+        prepare: db.prepare.bind(db),
+        async batch(statements) {
+          await db.prepare("DELETE FROM inventory_memberships WHERE inventory_id = ? AND user_id = ?")
+            .bind(request.headers.get("x-test-revoke"), "user-a").run();
+          return db.batch(statements);
+        }
+      };
+      return testWorker.fetch(request, { ...env, DB: wrapped });
+    } };`
+  ),
   compatibilityDate: "2026-10-06",
   telemetry: { enabled: false },
   d1Databases: { DB: "containers-tests", MIGRATION_DB: "migration-tests" },
@@ -31,12 +50,25 @@ async function migrate(database, files) {
 
 before(async () => {
   db = await mf.getD1Database("DB");
-  await migrate(db, ["0001_initial_schema.sql", "0002_add_inventories.sql", "0003_add_container_version.sql"]);
+  await migrate(db, ["0001_initial_schema.sql", "0002_add_inventories.sql", "0003_add_container_version.sql", "0004_add_users_and_memberships.sql"]);
   await db.batch([
-    ...["home-main", "other"].map(id => db.prepare(
+    ...["user-a", "user-b", "user-c"].map(id => db.prepare(
+      "INSERT INTO users VALUES (?1, ?2, ?3, ?3)"
+    ).bind(id, `${id}@example.test`, timestamp)),
+    ...["user-a", "user-b", "user-c"].map(id => db.prepare(
+      "INSERT INTO user_identities VALUES (?1, ?1, 'test', 'local', ?1, ?2, ?2)"
+    ).bind(id, timestamp)),
+    ...["home-main", "other", "inventory-a", "inventory-b"].map(id => db.prepare(
       "INSERT INTO inventories VALUES (?1, ?1, ?2, ?2)"
     ).bind(id, timestamp)),
-    ...[["home-a", "home-main"], ["home-b", "home-main"], ["other-a", "other"]].map(([id, inventory]) =>
+    db.prepare("INSERT INTO inventory_memberships VALUES ('home-main', 'user-a', 'owner', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('other', 'user-a', 'owner', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('home-main', 'user-b', 'viewer', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('other', 'user-b', 'editor', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'user-a', 'owner', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'user-b', 'viewer', ?1, ?1)").bind(timestamp),
+    db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-b', 'user-b', 'editor', ?1, ?1)").bind(timestamp),
+    ...[["inventory-a-location", "inventory-a"], ["inventory-b-location", "inventory-b"], ["home-a", "home-main"], ["home-b", "home-main"], ["other-a", "other"]].map(([id, inventory]) =>
       db.prepare("INSERT INTO locations VALUES (?1, ?2, ?1, ?3, ?3)").bind(id, inventory, timestamp)),
     ...[["zone-a", "home-a"], ["zone-b", "home-b"]].map(([id, location]) =>
       db.prepare("INSERT INTO zones VALUES (?1, ?2, ?1, ?3, ?3)").bind(id, location, timestamp))
@@ -565,3 +597,143 @@ for (const [detail, status, code] of [["private SQL details", 500, "INTERNAL_ERR
     assert.ok(!JSON.stringify(result).includes("private"));
   });
 }
+
+
+// Identity headers below are interpreted only by the injected test entrypoint.
+const authFetch = (path, user, init = {}) => mf.dispatchFetch(`http://localhost${path}`, {
+  ...init, headers: { "Content-Type": "application/json", "x-test-identity": user, ...init.headers }
+});
+const apiCall = (path, user, method, body, headers = {}) => authFetch(path, user, {
+  method, headers, body: JSON.stringify(body)
+});
+
+test("roles, usuario no registrado y privacidad de inventarios", async () => {
+  for (const [user, inventory, status] of [
+    ["user-a", "inventory-a", 200], ["user-b", "inventory-a", 200],
+    ["user-b", "inventory-b", 200], ["user-a", "inventory-b", 404],
+    ["user-c", "inventory-a", 404], ["user-c", "inventory-b", 404],
+    ["unknown", "inventory-a", 403], ["unauthenticated", "inventory-a", 401]
+  ]) {
+    const response = await authFetch(`/api/data?inventory_id=${inventory}`, user);
+    assert.equal(response.status, status, `${user} ${inventory}`);
+    if (status === 403) assert.equal((await response.json()).error.code, "USER_NOT_REGISTERED");
+    if (status === 401) assert.equal((await response.json()).error.code, "UNAUTHENTICATED");
+  }
+  const foreign = await authFetch("/api/data?inventory_id=inventory-b", "user-a");
+  const missing = await authFetch("/api/data?inventory_id=does-not-exist", "user-a");
+  assert.equal(foreign.status, 404);
+  assert.equal(await foreign.text(), await missing.text());
+});
+
+test("owner y editor pueden crear, editar y mover; viewer no puede escribir", async () => {
+  for (const [user, inventory, location, role] of [
+    ["user-a", "inventory-a", "inventory-a-location", "owner"],
+    ["user-b", "inventory-b", "inventory-b-location", "editor"]
+  ]) {
+    const created = await apiCall("/api/containers", user, "POST", {
+      inventory_id: inventory, uid: `uid-${role}`, location_id: location,
+      zone_id: null, name: "A", type: "", note: ""
+    });
+    assert.equal(created.status, 201);
+    const { container } = await created.json();
+    let response = await apiCall(`/api/containers/${container.id}?inventory_id=${inventory}`, user, "PATCH", { expected_version: 1, name: "B" });
+    assert.equal(response.status, 200);
+    response = await apiCall(`/api/containers/${container.id}/move?inventory_id=${inventory}`, user, "PATCH", { expected_version: 2, location_id: location, zone_id: null });
+    assert.equal(response.status, 200);
+  }
+  const create = { inventory_id: "inventory-a", uid: "viewer", location_id: "inventory-a-location", zone_id: null, name: "A", type: "", note: "" };
+  for (const [path, method, body] of [
+    ["/api/containers", "POST", create],
+    ["/api/containers/C054?inventory_id=inventory-a", "PATCH", { expected_version: 3, name: "C" }],
+    ["/api/containers/C054/move?inventory_id=inventory-a", "PATCH", { expected_version: 3, location_id: "inventory-a-location", zone_id: null }]
+  ]) {
+    const response = await apiCall(path, "user-b", method, body);
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error.code, "FORBIDDEN");
+  }
+});
+
+test("revocación antes del batch impide escribir y oculta current_container", async () => {
+  const original = await row();
+  try {
+    const response = await apiCall("/api/containers/C053?inventory_id=home-main", "user-a", "PATCH",
+      { expected_version: 99, name: "Forbidden" }, { "x-test-revoke": "home-main" });
+    assert.equal(response.status, 404);
+    assert.deepEqual(Object.keys(await response.json()), ["error"]);
+    assert.deepEqual(await row(), original);
+  } finally {
+    await db.prepare("INSERT INTO inventory_memberships VALUES ('home-main', 'user-a', 'owner', ?1, ?1)").bind(timestamp).run();
+  }
+});
+
+test("0004 conserva toda la estructura y datos anteriores", async () => {
+  const database = await mf.getD1Database("MIGRATION_DB");
+  await database.prepare("INSERT INTO item_photos VALUES ('photo', 'item-0', 'key', 0, 'image/png', 12, 2, 3, ?1)").bind(timestamp).run();
+  const tables = ["inventories", "locations", "zones", "containers", "items", "item_photos", "sqlite_sequence"];
+  const snapshot = async () => Promise.all(tables.map(async table => (await database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()).results));
+  const before = await snapshot();
+  await migrate(database, ["0004_add_users_and_memberships.sql"]);
+  assert.deepEqual(await snapshot(), before);
+});
+
+test("identificadores ajenos no permiten cruzar inventarios", async () => {
+  await db.prepare("INSERT INTO zones VALUES ('foreign-zone', 'other-a', 'Foreign', ?1, ?1)").bind(timestamp).run();
+  try {
+    const create = { inventory_id: "inventory-a", uid: "foreign-location", location_id: "other-a", zone_id: null, name: "A", type: "", note: "" };
+    let response = await apiCall("/api/containers", "user-a", "POST", create);
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "LOCATION_NOT_FOUND");
+    response = await apiCall("/api/containers/C053?inventory_id=inventory-a", "user-a", "PATCH", { expected_version: 1, name: "X" });
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "CONTAINER_NOT_FOUND");
+    response = await apiCall("/api/containers/C053/move?inventory_id=home-main", "user-a", "PATCH", { expected_version: 1, location_id: "home-a", zone_id: "foreign-zone" });
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "ZONE_NOT_FOUND");
+    response = await apiCall("/api/containers/C053?inventory_id=inventory-b", "user-a", "PATCH", { expected_version: 1, name: "X" });
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "INVENTORY_NOT_FOUND");
+  } finally {
+    await db.prepare("DELETE FROM zones WHERE id = 'foreign-zone'").run();
+  }
+});
+
+test("revocación anterior al batch impide POST, PATCH y move", async () => {
+  const operations = [
+    ["/api/containers", "POST", { inventory_id: "home-main", uid: "revoked", location_id: "home-a", zone_id: null, name: "A", type: "", note: "" }],
+    ["/api/containers/C053?inventory_id=home-main", "PATCH", { expected_version: 1, name: "A" }],
+    ["/api/containers/C053/move?inventory_id=home-main", "PATCH", { expected_version: 1, location_id: "home-b", zone_id: null }]
+  ];
+  for (const [path, method, body] of operations) {
+    const original = await row();
+    const oldCount = await count();
+    try {
+      const response = await apiCall(path, "user-a", method, body, { "x-test-revoke": "home-main" });
+      assert.equal(response.status, 404);
+      assert.deepEqual(Object.keys(await response.json()), ["error"]);
+      assert.deepEqual(await row(), original);
+      assert.equal(await count(), oldCount);
+    } finally {
+      await db.prepare("INSERT INTO inventory_memberships VALUES ('home-main', 'user-a', 'owner', ?1, ?1)").bind(timestamp).run();
+    }
+  }
+});
+
+test("Worker sin proveedor rechaza cabeceras de identidad sintética", async () => {
+  const isolated = new Miniflare(convertV4MiniflareOptions({
+    modules: true, scriptPath: fileURLToPath(new URL("../src/worker.js", import.meta.url)),
+    compatibilityDate: "2026-10-06", telemetry: { enabled: false }
+  }));
+  try {
+    const response = await isolated.dispatchFetch("http://localhost/api/data?inventory_id=home-main", { headers: { "x-test-identity": "user-a" } });
+    assert.equal(response.status, 401);
+    assert.equal((await response.json()).error.code, "UNAUTHENTICATED");
+  } finally { await isolated.dispose(); }
+});
+
+test("0004 impone roles, unicidad y claves foráneas", async () => {
+  await assert.rejects(db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'user-c', 'admin', ?1, ?1)").bind(timestamp).run(), /CHECK constraint failed/);
+  await assert.rejects(db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'user-a', 'owner', ?1, ?1)").bind(timestamp).run(), /UNIQUE constraint failed/);
+  await assert.rejects(db.prepare("INSERT INTO inventory_memberships VALUES ('inventory-a', 'missing', 'viewer', ?1, ?1)").bind(timestamp).run(), /FOREIGN KEY constraint failed/);
+  await assert.rejects(db.prepare("INSERT INTO user_identities VALUES ('duplicate', 'user-c', 'test', 'local', 'user-a', ?1, ?1)").bind(timestamp).run(), /UNIQUE constraint failed/);
+  await assert.rejects(db.prepare("DELETE FROM users WHERE id = 'user-a'").run(), /FOREIGN KEY constraint failed/);
+});

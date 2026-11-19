@@ -11,7 +11,30 @@ const apiJson = (body, status = 200, extraHeaders = {}) =>
 const apiError = (status, code, message, headers) =>
   apiJson({ error: { code, message } }, status, headers);
 
-async function createContainer(request, env) {
+// Identity must be supplied by a trusted adapter; the default has none.
+// Never derive it from a client-controlled header here.
+async function requireInventoryAccess(env, identity, inventoryId, permission) {
+  if (!identity || ![identity.provider, identity.issuer, identity.subject].every(
+    value => typeof value === "string" && value.length > 0
+  )) return { error: apiError(401, "UNAUTHENTICATED", "Autenticación requerida.") };
+  const user = await env.DB.prepare(`
+    SELECT user_id FROM user_identities WHERE provider = ? AND issuer = ? AND subject = ?
+  `).bind(identity.provider, identity.issuer, identity.subject).first();
+  if (!user) return { error: apiError(403, "USER_NOT_REGISTERED", "Usuario no registrado.") };
+  const membership = await env.DB.prepare(`
+    SELECT role FROM inventory_memberships WHERE inventory_id = ? AND user_id = ?
+  `).bind(inventoryId, user.user_id).first();
+  return membershipAccess(user.user_id, inventoryId, permission, membership?.role);
+}
+
+function membershipAccess(userId, inventoryId, permission, role) {
+  if (!role) return { error: apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.") };
+  const allowed = { viewer: ["read"], editor: ["read", "write"], owner: ["read", "write", "admin"] };
+  if (!allowed[role]?.includes(permission)) return { error: apiError(403, "FORBIDDEN", "Permiso insuficiente.") };
+  return { userId, inventoryId, role };
+}
+
+async function createContainer(request, env, identity) {
   if (request.method !== "POST") {
     return apiError(405, "METHOD_NOT_ALLOWED", "Solo se permite el método POST.", { Allow: "POST" });
   }
@@ -45,11 +68,14 @@ async function createContainer(request, env) {
   }
 
   try {
+    const access = await requireInventoryAccess(env, identity, body.inventory_id, "write");
+    if (access.error) return access.error;
     const timestamp = new Date().toISOString();
     const identifiers = [body.inventory_id, body.location_id, body.zone_id, body.uid];
     // The guarded INSERT repeats validation inside the same D1 transaction.
     // Neither number nor the generated id is supplied by the Worker.
-    const [validation, insertion] = await env.DB.batch([
+    const [authorization, validation, insertion] = await env.DB.batch([
+      env.DB.prepare("SELECT role FROM inventory_memberships WHERE inventory_id = ? AND user_id = ?").bind(body.inventory_id, access.userId),
       env.DB.prepare(`
         SELECT
           EXISTS(SELECT 1 FROM inventories WHERE id = ?1) AS inventory_exists,
@@ -73,14 +99,18 @@ async function createContainer(request, env) {
           SELECT 1 FROM zones WHERE id = ?3 AND location_id = ?2
         ))
         AND NOT EXISTS (SELECT 1 FROM containers WHERE uid = ?4)
+        AND EXISTS (SELECT 1 FROM inventory_memberships WHERE inventory_id = ?1
+          AND user_id = ?9 AND role IN ('owner', 'editor'))
         RETURNING number, id, uid, location_id, zone_id,
                   name, type, note, created_at, updated_at, version
-      `).bind(...identifiers, body.name.trim(), body.type, body.note, timestamp)
+      `).bind(...identifiers, body.name.trim(), body.type, body.note, timestamp, access.userId)
     ]);
 
-    if (!validation.success || !insertion.success || validation.results.length !== 1) {
+    if (!authorization.success || !validation.success || !insertion.success || validation.results.length !== 1) {
       throw new Error("Unexpected D1 batch result");
     }
+    const effective = membershipAccess(access.userId, body.inventory_id, "write", authorization.results[0]?.role);
+    if (effective.error) return effective.error;
     const checks = validation.results[0];
     if (!checks.inventory_exists) {
       return apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.");
@@ -111,7 +141,7 @@ async function createContainer(request, env) {
   }
 }
 
-async function patchContainer(request, env, url, id) {
+async function patchContainer(request, env, url, id, identity) {
   if (request.method !== "PATCH") {
     return apiError(405, "METHOD_NOT_ALLOWED", "Solo se permite el método PATCH.", { Allow: "PATCH" });
   }
@@ -148,11 +178,14 @@ async function patchContainer(request, env, url, id) {
   }
   const inventoryId = inventoryIds[0];
   try {
+    const access = await requireInventoryAccess(env, identity, inventoryId, "write");
+    if (access.error) return access.error;
     const values = fields.map(field => field === "name" ? body[field].trim() : body[field]);
     const columns = "number, id, uid, location_id, zone_id, name, type, note, created_at, updated_at, version";
     // D1 batch is transactional: the conditional UPDATE decides success, and
     // the following scoped read supplies a consistent current row on conflict.
-    const [inventory, update, current] = await env.DB.batch([
+    const [authorization, inventory, update, current] = await env.DB.batch([
+      env.DB.prepare("SELECT role FROM inventory_memberships WHERE inventory_id = ? AND user_id = ?").bind(inventoryId, access.userId),
       env.DB.prepare("SELECT id FROM inventories WHERE id = ?").bind(inventoryId),
       env.DB.prepare(`
         UPDATE containers
@@ -164,8 +197,10 @@ async function patchContainer(request, env, url, id) {
             WHERE locations.id = containers.location_id
               AND locations.inventory_id = ?
           )
+          AND EXISTS (SELECT 1 FROM inventory_memberships WHERE inventory_id = ?
+            AND user_id = ? AND role IN ('owner', 'editor'))
         RETURNING ${columns}
-      `).bind(...values, new Date().toISOString(), id, body.expected_version, inventoryId),
+      `).bind(...values, new Date().toISOString(), id, body.expected_version, inventoryId, inventoryId, access.userId),
       env.DB.prepare(`
         SELECT ${columns} FROM containers
         WHERE id = ? AND EXISTS (
@@ -174,9 +209,11 @@ async function patchContainer(request, env, url, id) {
         )
       `).bind(id, inventoryId)
     ]);
-    if ([inventory, update, current].some(result => !result.success)) {
+    if ([authorization, inventory, update, current].some(result => !result.success)) {
       throw new Error("Unexpected D1 batch result");
     }
+    const effective = membershipAccess(access.userId, inventoryId, "write", authorization.results[0]?.role);
+    if (effective.error) return effective.error;
     if (!inventory.results.length) {
       return apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.");
     }
@@ -199,7 +236,7 @@ async function patchContainer(request, env, url, id) {
   }
 }
 
-async function moveContainer(request, env, url, id) {
+async function moveContainer(request, env, url, id, identity) {
   if (request.method !== "PATCH") {
     return apiError(405, "METHOD_NOT_ALLOWED", "Solo se permite el método PATCH.", { Allow: "PATCH" });
   }
@@ -234,8 +271,11 @@ async function moveContainer(request, env, url, id) {
   const inventoryId = inventoryIds[0];
   const columns = "number, id, uid, location_id, zone_id, name, type, note, created_at, updated_at, version";
   try {
+    const access = await requireInventoryAccess(env, identity, inventoryId, "write");
+    if (access.error) return access.error;
     // D1 executes the checks, guarded update and scoped conflict read atomically.
-    const [validation, update, current] = await env.DB.batch([
+    const [authorization, validation, update, current] = await env.DB.batch([
+      env.DB.prepare("SELECT role FROM inventory_memberships WHERE inventory_id = ? AND user_id = ?").bind(inventoryId, access.userId),
       env.DB.prepare(`
         SELECT EXISTS(SELECT 1 FROM inventories WHERE id = ?1) AS inventory_exists,
           EXISTS(SELECT 1 FROM locations WHERE id = ?2 AND inventory_id = ?1) AS location_valid,
@@ -250,17 +290,21 @@ async function moveContainer(request, env, url, id) {
           AND EXISTS (SELECT 1 FROM locations WHERE id = containers.location_id AND inventory_id = ?6)
           AND EXISTS (SELECT 1 FROM locations WHERE id = ?1 AND inventory_id = ?6)
           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM zones WHERE id = ?2 AND location_id = ?1))
+          AND EXISTS (SELECT 1 FROM inventory_memberships WHERE inventory_id = ?6
+            AND user_id = ?7 AND role IN ('owner', 'editor'))
         RETURNING ${columns}
-      `).bind(body.location_id, body.zone_id, new Date().toISOString(), id, body.expected_version, inventoryId),
+      `).bind(body.location_id, body.zone_id, new Date().toISOString(), id, body.expected_version, inventoryId, access.userId),
       env.DB.prepare(`
         SELECT ${columns} FROM containers WHERE id = ? AND EXISTS (
           SELECT 1 FROM locations WHERE id = containers.location_id AND inventory_id = ?
         )
       `).bind(id, inventoryId)
     ]);
-    if ([validation, update, current].some(result => !result.success) || validation.results.length !== 1) {
+    if ([authorization, validation, update, current].some(result => !result.success) || validation.results.length !== 1) {
       throw new Error("Unexpected D1 batch result");
     }
+    const effective = membershipAccess(access.userId, inventoryId, "write", authorization.results[0]?.role);
+    if (effective.error) return effective.error;
     const checks = validation.results[0];
     if (!checks.inventory_exists) return apiError(404, "INVENTORY_NOT_FOUND", "El inventario no existe.");
     if (!current.results.length) return apiError(404, "CONTAINER_NOT_FOUND", "El contenedor no existe en ese inventario.");
@@ -281,20 +325,30 @@ async function moveContainer(request, env, url, id) {
   }
 }
 
-export default {
+export function createWorker(getAuthenticatedIdentity = async () => null) {
+  return {
   async fetch(request, env) {
     const url = new URL(request.url);
+    let identity = null;
+    if (url.pathname === "/api/data" || url.pathname === "/api/containers" || url.pathname.startsWith("/api/containers/")) {
+      try {
+        identity = await getAuthenticatedIdentity(request, env);
+      } catch {
+        return apiError(401, "UNAUTHENTICATED", "Autenticación requerida.");
+      }
+      if (!identity) return apiError(401, "UNAUTHENTICATED", "Autenticación requerida.");
+    }
 
     if (url.pathname.startsWith("/api/containers/") && url.pathname.endsWith("/move")) {
-      return moveContainer(request, env, url, url.pathname.slice("/api/containers/".length, -"/move".length));
+      return moveContainer(request, env, url, url.pathname.slice("/api/containers/".length, -"/move".length), identity);
     }
 
     if (url.pathname.startsWith("/api/containers/")) {
-      return patchContainer(request, env, url, url.pathname.slice("/api/containers/".length));
+      return patchContainer(request, env, url, url.pathname.slice("/api/containers/".length), identity);
     }
 
     if (url.pathname === "/api/containers") {
-      return createContainer(request, env);
+      return createContainer(request, env, identity);
     }
 
     if (url.pathname === "/api/health") {
@@ -370,6 +424,8 @@ export default {
       const inventoryId = inventoryIds[0];
 
       try {
+        const access = await requireInventoryAccess(env, identity, inventoryId, "read");
+        if (access.error) return access.error;
         const inventory = await env.DB.prepare(`
           SELECT id, name, created_at, updated_at
           FROM inventories
@@ -478,4 +534,7 @@ export default {
 
     return env.ASSETS.fetch(request);
   }
-};
+  };
+}
+
+export default createWorker();
