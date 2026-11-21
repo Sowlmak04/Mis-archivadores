@@ -79,7 +79,8 @@ function normalizeItem(item) {
     id: item?.id || newId("item"),
     name: String(item?.name || "").trim(),
     note: String(item?.note || "").trim(),
-    photoKey: item?.photoKey || null
+    photoKey: item?.photoKey || null,
+    photos: Array.isArray(item?.photos) ? item.photos : []
   };
 }
 
@@ -136,23 +137,67 @@ function reconcileItems(oldItems, names) {
 function loadData() {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (!stored) return clone(EMPTY_DATA);
+    if (!stored) throw new Error("No local backup");
     const loaded = JSON.parse(stored);
     if (!Array.isArray(loaded.locations) || !Array.isArray(loaded.zones) || !Array.isArray(loaded.containers)) {
-      return clone(EMPTY_DATA);
+      throw new Error("Invalid local backup");
     }
     const normalized = normalizeData(loaded);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
     return normalized;
   } catch (error) {
-    window.alert("No se han cargado los datos: " + error.message + " No se ha borrado el almacenamiento. Revisa una copia válida antes de continuar.");
     throw error;
   }
 }
 
-let data = loadData();
+// El almacenamiento anterior solo se consulta como fallback de lectura.
+let data = clone(EMPTY_DATA);
+let loadState = "loading";
+
+function adaptRemoteData(payload) {
+  for (const key of ["locations", "zones", "containers", "items", "item_photos"]) {
+    if (!Array.isArray(payload?.[key])) throw new Error("Invalid inventory");
+  }
+  if (!payload.inventory || typeof payload.inventory !== "object") throw new Error("Invalid inventory");
+  const photos = new Map();
+  for (const photo of payload.item_photos) {
+    if (!photos.has(photo.item_id)) photos.set(photo.item_id, []);
+    photos.get(photo.item_id).push({ ...photo });
+  }
+  const items = new Map();
+  for (const item of payload.items) {
+    if (!items.has(item.container_id)) items.set(item.container_id, []);
+    items.get(item.container_id).push({ id: item.id, name: item.name, note: item.note || "", photos: photos.get(item.id) || [] });
+  }
+  return normalizeData({
+    locations: payload.locations.map(location => ({ ...location })),
+    zones: payload.zones.map(zone => ({ ...zone, locationId: zone.location_id })),
+    containers: payload.containers.map(container => ({
+      ...container, locationId: container.location_id, zoneId: container.zone_id,
+      type: container.type || "", note: container.note || "", items: items.get(container.id) || []
+    }))
+  });
+}
+
+async function loadInventory(fetchInventory, loadLegacy) {
+  try {
+    const response = await fetchInventory("/api/data?inventory_id=home-main");
+    if ([401, 403, 404].includes(response.status)) return { state: "denied", status: response.status, data: clone(EMPTY_DATA) };
+    if (!response.ok) throw new Error("Request failed");
+    return { state: "remote", data: adaptRemoteData(await response.json()) };
+  } catch {
+    try { return { state: "fallback", data: loadLegacy() }; }
+    catch { return { state: "unavailable", data: clone(EMPTY_DATA) }; }
+  }
+}
+
+
+// En esta fase todo el inventario es de solo lectura, también el fallback.
+function inventoryIsReadOnly() {
+  return true;
+}
 
 function saveData() {
+  if (inventoryIsReadOnly()) throw new Error("Inventory is read-only");
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
@@ -225,6 +270,7 @@ function zoneByImportedId(imported, id) {
 }
 
 async function importBackup(file) {
+  if (inventoryIsReadOnly()) return false;
   if (!file) return false;
 
   let payload;
@@ -538,6 +584,7 @@ function newContainerView(zoneId) {
 
   app.querySelector("#newContainerForm").addEventListener("submit", event => {
     event.preventDefault();
+    if (inventoryIsReadOnly()) return;
 
     const name = document.querySelector("#newName").value.trim();
     const type = document.querySelector("#newType").value.trim();
@@ -625,6 +672,7 @@ function newLocationContainerView(locationId) {
 
   app.querySelector("#newContainerForm").addEventListener("submit", event => {
     event.preventDefault();
+    if (inventoryIsReadOnly()) return;
 
     const name = document.querySelector("#newName").value.trim();
     const type = document.querySelector("#newType").value.trim();
@@ -739,6 +787,7 @@ function moveContainerView(id) {
   app.querySelector("[data-cancel]").addEventListener("click", back);
   app.querySelector("#moveContainerForm").addEventListener("submit", event => {
     event.preventDefault();
+    if (inventoryIsReadOnly()) return;
     const locationId = locationSelect.value;
     const zoneId = zoneSelect.value || null;
     if (!locationById(locationId) || (zoneId && zoneById(zoneId)?.locationId !== locationId)) {
@@ -774,11 +823,6 @@ function editView(id) {
       </div>
     </form>
 
-    <section class="danger-zone">
-      <strong>Eliminar contenedor</strong>
-      <p>Elimina este contenedor y todo su índice. Esta acción no se puede deshacer.</p>
-      <button class="danger-button" type="button" data-delete-container>Eliminar contenedor</button>
-    </section>
   `;
 
   const back = () => navigate(`#container/${c.id}`);
@@ -787,6 +831,7 @@ function editView(id) {
 
   app.querySelector("#editorForm").addEventListener("submit", event => {
     event.preventDefault();
+    if (inventoryIsReadOnly()) return;
     c.name = app.querySelector("#name").value.trim() || c.name;
     c.type = app.querySelector("#type").value.trim() || c.type;
     c.note = app.querySelector("#note").value.trim();
@@ -794,15 +839,6 @@ function editView(id) {
     saveData();
     showToast("Contenedor actualizado");
     setTimeout(back, 250);
-  });
-
-  app.querySelector("[data-delete-container]")?.addEventListener("click", () => {
-    if (!window.confirm(`¿Eliminar “${c.name}” y todo su índice?\n\nEsta acción no se puede deshacer.`)) return;
-    const returnLocation = c.locationId;
-    data.containers = data.containers.filter(item => item.id !== c.id);
-    saveData();
-    showToast("Contenedor eliminado");
-    setTimeout(() => navigate(`#location/${returnLocation}`), 250);
   });
 }
 function itemView(containerUid, itemId) {
@@ -822,13 +858,13 @@ function itemView(containerUid, itemId) {
       <p>${escapeHTML(loc?.name || "")}${zone ? ` · ${escapeHTML(zone.name)}` : ""} · ${escapeHTML(c.name)}</p>
     </section>
     <form class="editor" id="itemForm">
-      <div class="field"><label for="itemName">Nombre</label><input id="itemName" value="${escapeHTML(item.name)}" autocomplete="off" required /></div>
-      <div class="field"><label for="itemNote">Nota</label><textarea id="itemNote" class="item-note-input" placeholder="Opcional. Añade aquí detalles que ayuden a identificar este objeto.">${escapeHTML(item.note || "")}</textarea></div>
+      <div class="field"><label for="itemName">Nombre</label><input id="itemName" readonly value="${escapeHTML(item.name)}" autocomplete="off" required /></div>
+      <div class="field"><label for="itemNote">Nota</label><textarea id="itemNote" readonly class="item-note-input" placeholder="Opcional. Añade aquí detalles que ayuden a identificar este objeto.">${escapeHTML(item.note || "")}</textarea></div>
       <section class="photo-placeholder">
         <div class="photo-placeholder-icon">${uiIcon("box")}</div>
         <div><strong>Fotografía opcional</strong><p>La ficha ya está preparada para asociar una imagen a este elemento. La subida se activará con Cloudflare R2 para que la foto esté sincronizada entre dispositivos.</p></div>
       </section>
-      <div class="actions"><button type="button" class="secondary-button" data-cancel>Cancelar</button><button type="submit" class="primary-button">Guardar elemento</button></div>
+      <div class="actions"><button type="button" class="secondary-button" data-cancel>Cancelar</button><span>La edición de elementos aún no está conectada a la sincronización remota.</span></div>
     </form>
   `;
   const back = () => navigate(`#c/${c.uid}`);
@@ -836,13 +872,6 @@ function itemView(containerUid, itemId) {
   app.querySelector("[data-cancel]")?.addEventListener("click", back);
   app.querySelector("#itemForm")?.addEventListener("submit", event => {
     event.preventDefault();
-    const name = app.querySelector("#itemName").value.trim();
-    if (!name) return showToast("Escribe un nombre");
-    item.name = name;
-    item.note = app.querySelector("#itemNote").value.trim();
-    saveData();
-    showToast("Elemento actualizado");
-    setTimeout(back, 250);
   });
 }
 
@@ -960,22 +989,24 @@ function zonesEditView(expandedLocations = new Set()) {
     zonesEditView(expandedLocations);
   }));
   app.querySelector("#locationForm")?.addEventListener("submit", e => {
-    e.preventDefault(); const input=app.querySelector("#locationName"); const name=input.value.trim(); if(!name)return;
+    e.preventDefault(); if (inventoryIsReadOnly()) return; const input=app.querySelector("#locationName"); const name=input.value.trim(); if(!name)return;
     data.locations.push({id:newId("loc"),name}); saveData(); zonesEditView(expandedLocations); showToast("Ubicación añadida");
   });
   app.querySelectorAll("[data-add-zone]").forEach(form => form.addEventListener("submit", e => {
-    e.preventDefault(); const locationId=form.dataset.addZone; const input=form.querySelector("input"); const name=input.value.trim(); if(!name)return;
+    e.preventDefault(); if (inventoryIsReadOnly()) return; const locationId=form.dataset.addZone; const input=form.querySelector("input"); const name=input.value.trim(); if(!name)return;
     data.zones.push({id:newId("zone"),locationId,name}); saveData(); expandedLocations.add(locationId); zonesEditView(expandedLocations); showToast("Zona añadida");
   }));
   app.querySelectorAll("[data-rename-location]").forEach(btn => btn.addEventListener("click", e => {
-    e.stopPropagation(); const loc=locationById(btn.dataset.renameLocation); const name=window.prompt("Nuevo nombre de la ubicación:",loc.name)?.trim(); if(!name)return;
+    e.stopPropagation(); if (inventoryIsReadOnly()) return; const loc=locationById(btn.dataset.renameLocation); const name=window.prompt("Nuevo nombre de la ubicación:",loc.name)?.trim(); if(!name)return;
     loc.name=name; saveData(); zonesEditView(expandedLocations); showToast("Ubicación actualizada");
   }));
   app.querySelectorAll("[data-rename-zone]").forEach(btn => btn.addEventListener("click", () => {
+    if (inventoryIsReadOnly()) return;
     const zone=zoneById(btn.dataset.renameZone); const name=window.prompt("Nuevo nombre de la zona:",zone.name)?.trim(); if(!name)return;
     zone.name=name; saveData(); zonesEditView(expandedLocations); showToast("Zona actualizada");
   }));
   app.querySelectorAll("[data-delete-zone]").forEach(btn => btn.addEventListener("click", () => {
+    if (inventoryIsReadOnly()) return;
     const zone = zoneById(btn.dataset.deleteZone);
     const containers = data.containers.filter(c => c.zoneId === zone?.id);
     if (!zone || !locationById(zone.locationId) || containers.some(c => c.locationId !== zone.locationId)) {
@@ -992,6 +1023,7 @@ function zonesEditView(expandedLocations = new Set()) {
   }));
   app.querySelectorAll("[data-delete-location]").forEach(btn => btn.addEventListener("click", e => {
     e.stopPropagation();
+    if (inventoryIsReadOnly()) return;
     const loc = locationById(btn.dataset.deleteLocation);
     if (!loc) return;
     const count = data.containers.filter(c => c.locationId === loc.id).length;
@@ -1087,7 +1119,7 @@ function transferView() {
         <span class="pill">${counts.containers} contenedores</span>
       </div>
       <h2>Copia de seguridad</h2>
-      <p>Exporta toda la información guardada en este dispositivo o restaura una copia anterior.</p>
+      <p>Exporta los datos que estás consultando como copia de seguridad.</p>
     </section>
 
     <section class="transfer-grid">
@@ -1104,10 +1136,9 @@ function transferView() {
         <div class="transfer-icon">${uiIcon("upload")}</div>
         <div>
           <h3>Importar</h3>
-          <p>Restaura una copia JSON. Los datos actuales se sustituirán únicamente después de confirmar.</p>
+          <p>La restauración de copias estará disponible cuando se conecte la escritura remota.</p>
         </div>
-        <input type="file" id="importFile" accept=".json,application/json" hidden />
-        <button class="secondary-button" data-import>Elegir archivo JSON</button>
+        <p>La importación aún no está conectada a la sincronización remota.</p>
       </article>
     </section>
 
@@ -1122,27 +1153,7 @@ function transferView() {
     showToast("Copia preparada");
   });
 
-  const fileInput = app.querySelector("#importFile");
 
-  app.querySelector("[data-import]")?.addEventListener("click", () => {
-    fileInput.value = "";
-    fileInput.click();
-  });
-
-  fileInput?.addEventListener("change", async () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
-
-    try {
-      const imported = await importBackup(file);
-      if (imported) {
-        showToast("Copia importada");
-        setTimeout(() => navigate("#home"), 350);
-      }
-    } catch (error) {
-      window.alert(error.message || "No se pudo importar el archivo.");
-    }
-  });
 }
 
 function notFound() {
@@ -1160,9 +1171,16 @@ function notFound() {
 }
 
 function route() {
+  if (loadState === "loading" || loadState === "denied" || loadState === "unavailable") return;
   const raw = location.hash.replace(/^#/, "") || "home";
   const [section, id] = raw.split("/");
 
+  if (inventoryIsReadOnly() && ["zones-edit", "new", "new-location", "edit", "move"].includes(section)) {
+    screenTitle.textContent = "Edición no disponible";
+    app.innerHTML = `<div class="empty"><strong>Edición no disponible todavía</strong>Esta acción aún no está conectada a la sincronización remota. No se ha guardado ningún cambio.<div class="actions"><button class="primary-button" data-home>Ir al inicio</button></div></div>`;
+    app.querySelector("[data-home]")?.addEventListener("click", () => navigate("#home"));
+    return;
+  }
   if (section === "home") return homeView();
   if (section === "search") return searchView();
   if (section === "transfer") return transferView();
@@ -1204,7 +1222,29 @@ document.addEventListener("click", event => {
 });
 
 window.addEventListener("hashchange", route);
-route();
+
+async function startApp() {
+  const status = document.querySelector("#loadStatus");
+  app.innerHTML = `<div class="empty"><strong>Cargando inventario…</strong>Espera un momento.</div>`;
+  const result = await loadInventory(fetch, loadData);
+  data = result.data;
+  loadState = result.state;
+  if (result.state === "remote") {
+    status.hidden = true;
+  } else if (result.state === "fallback") {
+    status.hidden = false;
+    status.textContent = "No se pudo conectar con el inventario. Se muestra la copia local de este dispositivo, que puede estar desactualizada. La edición está desactivada.";
+  } else {
+    status.hidden = false;
+    status.textContent = result.state === "denied"
+      ? ({ 401: "Tu sesión no está disponible. Vuelve a acceder para consultar el inventario.", 403: "No tienes acceso a este inventario.", 404: "No se ha encontrado el inventario." })[result.status]
+      : "No se pudo cargar el inventario ni la copia local. Comprueba la conexión y vuelve a intentarlo.";
+    app.innerHTML = `<div class="empty"><strong>Inventario no disponible</strong>Recarga la página para volver a intentarlo.</div>`;
+    return;
+  }
+  route();
+}
+startApp();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {

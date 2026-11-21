@@ -947,3 +947,5 @@ html[data-theme="dark"] .search-input { background:var(--surface-solid); }
 .icon-action .ui-icon { width:18px; height:18px; }
 .mini-actions { flex-wrap:nowrap; flex:0 0 auto; }
 .structure-body .zone-editor-list { margin-top:12px; }
+
+.load-status:not([hidden]) { padding: 12px 20px; background: #fff3cd; color: #503b00; font-size: 0.9rem; line-height: 1.4; }
